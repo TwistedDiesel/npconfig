@@ -9,8 +9,8 @@ No sysadmin should have to bring a netplan manual just to bring networking up.
 - **ifconfig-style commands** for quick provisioning
 - **Wi-Fi setup** (scan, connect, hidden SSID, DHCP/static)
 - **Interactive menu** (`npconfig menu`) using `dialog` or `whiptail`
-- Writes persistent config to `/etc/netplan/99-npconfig-IFACE.yaml`
-- Uses **NetworkManager** renderer (standard on Ubuntu desktop/server with NM)
+- Auto-detects **NetworkManager** vs **systemd-networkd** renderer
+- Applies config via `netplan apply` (no hard dependency on NetworkManager)
 
 ## Requirements
 

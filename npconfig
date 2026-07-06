@@ -12,6 +12,43 @@ fi
 NETPLAN_DIR=/etc/netplan
 FILE_PREFIX=99-npconfig
 UI_BIN=""
+NETPLAN_RENDERER=""
+
+has_unit_file() {
+  systemctl list-unit-files "$1" 2>/dev/null | grep -q "^$1"
+}
+
+detect_netplan_renderer() {
+  if [[ -n "$NETPLAN_RENDERER" ]]; then
+    printf '%s' "$NETPLAN_RENDERER"
+    return 0
+  fi
+
+  local hinted=""
+  hinted=$(grep -rh '^[[:space:]]*renderer:' "${NETPLAN_DIR}/"*.yaml 2>/dev/null | head -1 | awk '{print $2}' || true)
+  if [[ "$hinted" == "NetworkManager" || "$hinted" == "networkd" ]]; then
+    NETPLAN_RENDERER="$hinted"
+    printf '%s' "$NETPLAN_RENDERER"
+    return 0
+  fi
+
+  if has_unit_file NetworkManager.service; then
+    NETPLAN_RENDERER="NetworkManager"
+  else
+    NETPLAN_RENDERER="networkd"
+  fi
+  printf '%s' "$NETPLAN_RENDERER"
+}
+
+uses_network_manager() {
+  [[ "$(detect_netplan_renderer)" == "NetworkManager" ]]
+}
+
+netplan_renderer_yaml() {
+  local renderer
+  renderer=$(detect_netplan_renderer)
+  printf '  renderer: %s\n' "$renderer"
+}
 
 is_wireless() {
   local iface="$1"
@@ -118,8 +155,7 @@ write_netplan_dhcp() {
   cat >"$file" <<YAML
 network:
   version: 2
-  renderer: NetworkManager
-  ${ytype}:
+$(netplan_renderer_yaml)  ${ytype}:
     ${iface}:
       dhcp4: true
 YAML
@@ -136,8 +172,7 @@ write_netplan_static() {
   cat >"$file" <<YAML
 network:
   version: 2
-  renderer: NetworkManager
-  ${ytype}:
+$(netplan_renderer_yaml)  ${ytype}:
     ${iface}:
       dhcp4: false
       addresses:
@@ -178,8 +213,7 @@ YAML
     cat >"$file" <<YAML
 network:
   version: 2
-  renderer: NetworkManager
-  wifis:
+$(netplan_renderer_yaml)  wifis:
     ${iface}:
       dhcp4: false
 ${ap_block}
@@ -193,8 +227,7 @@ YAML
     cat >"$file" <<YAML
 network:
   version: 2
-  renderer: NetworkManager
-  wifis:
+$(netplan_renderer_yaml)  wifis:
     ${iface}:
       dhcp4: true
 ${ap_block}
@@ -270,7 +303,7 @@ show_wifi_status() {
 wifi_prepare_iface() {
   local iface="$1"
   ip link set dev "$iface" up 2>/dev/null || true
-  if command -v nmcli >/dev/null 2>&1; then
+  if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
     nmcli radio wifi on >/dev/null 2>&1 || true
     nmcli dev set "$iface" managed yes >/dev/null 2>&1 || true
     timeout 20 nmcli dev wifi rescan ifname "$iface" >/dev/null 2>&1 || true
@@ -336,6 +369,75 @@ apply_netplan() {
   timeout 90 netplan apply
 }
 
+renew_dhcp_lease() {
+  local iface="$1"
+  if command -v networkctl >/dev/null 2>&1; then
+    networkctl renew "$iface" >/dev/null 2>&1 && return 0
+  fi
+  if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
+    nmcli device reapply "$iface" >/dev/null 2>&1 && return 0
+    nmcli device connect "$iface" >/dev/null 2>&1 && return 0
+  fi
+  if command -v dhclient >/dev/null 2>&1; then
+    dhclient -r "$iface" >/dev/null 2>&1 || true
+    dhclient "$iface" >/dev/null 2>&1 && return 0
+  fi
+  apply_netplan
+}
+
+iface_status_summary() {
+  local iface="$1" kind="${2:-Interface}"
+  local state carrier ip gw dns ssid file
+
+  state=$(<"/sys/class/net/${iface}/operstate" 2>/dev/null || echo unknown)
+  state=${state^^}
+  if [[ -r "/sys/class/net/${iface}/carrier" ]]; then
+    carrier=$(<"/sys/class/net/${iface}/carrier")
+    [[ "$carrier" == "1" ]] && carrier=YES || carrier=NO
+  else
+    carrier=n/a
+  fi
+
+  ip=$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}' | head -1)
+  [[ -z "$ip" ]] && ip=none
+
+  gw=$(ip -4 route show dev "$iface" default 2>/dev/null | awk '{print $3}' | head -1)
+  [[ -z "$gw" ]] && gw=$(ip -4 route show default 2>/dev/null | awk '{print $3}' | head -1)
+  [[ -z "$gw" ]] && gw=none
+
+  dns=$(awk '/^nameserver / {print $2}' /etc/resolv.conf 2>/dev/null | head -3 | paste -sd, -)
+  [[ -z "$dns" ]] && dns=none
+
+  printf '%s: %s\n\nStatus : %s\nCarrier: %s\nIP     : %s\nGateway: %s\nDNS    : %s' \
+    "$kind" "$iface" "$state" "$carrier" "$ip" "$gw" "$dns"
+
+  if is_wireless "$iface"; then
+    ssid=$(iwgetid "$iface" -r 2>/dev/null || true)
+    if [[ -z "$ssid" ]]; then
+      file=$(netplan_file_for "$iface")
+      if [[ -f "$file" ]]; then
+        ssid=$(awk '
+          /^[[:space:]]*access-points:/ {show=1}
+          show && /^[[:space:]]*"/ {
+            gsub(/^[[:space:]]*"/, "", $0)
+            gsub(/":.*/, "", $0)
+            print $0
+            exit
+          }
+        ' "$file" 2>/dev/null || true)
+      fi
+    fi
+    [[ -n "$ssid" ]] && printf '\nSSID   : %s' "$ssid"
+  fi
+
+  printf '\nBackend: %s' "$(detect_netplan_renderer)"
+}
+
+iface_menu_body() {
+  local iface="$1" kind="$2"
+  printf '%s\n\n------------------------------\n\nChoose an action:' "$(iface_status_summary "$iface" "$kind")"
+}
+
 ui_init() {
   if command -v dialog >/dev/null 2>&1; then
     UI_BIN=dialog
@@ -376,7 +478,7 @@ ui_password() {
 ui_menu() {
   local title="$1" text="$2"
   shift 2
-  "$UI_BIN" --title "$title" --menu "$text" 20 78 12 "$@" 3>&1 1>&2 2>&3
+  "$UI_BIN" --title "$title" --menu "$text" 24 78 10 "$@" 3>&1 1>&2 2>&3
 }
 
 ui_textbox() {
@@ -461,16 +563,18 @@ menu_static_ip_form() {
 }
 
 menu_configure_ethernet() {
-  local iface choice addr netmask prefix
+  local iface choice addr netmask prefix body
   iface=$(iface_menu_pick "Ethernet interface" ethernet) || return 0
 
   while true; do
-    choice=$(ui_menu "Ethernet: ${iface}" "Choose an action:" \
+    body=$(iface_menu_body "$iface" "Ethernet")
+    choice=$(ui_menu "Ethernet: ${iface}" "$body" \
       dhcp "Use DHCP" \
-      static "Static IPv4" \
-      up "Bring interface up" \
-      down "Bring interface down" \
-      status "Show status" \
+      static "Configure Static IPv4" \
+      up "Bring Interface Up" \
+      down "Bring Interface Down" \
+      renew "Renew DHCP Lease" \
+      status "Show Detailed Status" \
       back "Back") || return 0
 
     case "$choice" in
@@ -490,11 +594,13 @@ menu_configure_ethernet() {
         ;;
       up)
         ip_link_set "$iface" up
-        ui_msg "Interface up" "${iface} is up."
         ;;
       down)
         ip_link_set "$iface" down
-        ui_msg "Interface down" "${iface} is down."
+        ;;
+      renew)
+        renew_dhcp_lease "$iface"
+        ui_msg "DHCP renewed" "Requested DHCP renewal on ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
         ;;
       status)
         iface_status_text "$iface"
@@ -515,7 +621,7 @@ menu_wifi_pick_network() {
   ui_msg "Wi-Fi scan" "Scanning on ${iface}.\nThis may take up to 20 seconds."
   if ! wifi_scan_to_file "$iface" "$scan_file"; then
     rm -f "$scan_file" "$map_file"
-    ui_msg "Scan failed" "Could not scan Wi-Fi on ${iface}.\n\nEnsure NetworkManager is running:\n  systemctl start NetworkManager\n\nOr install iw for basic scan support."
+    ui_msg "Scan failed" "Could not scan Wi-Fi on ${iface}.\n\nBackend: $(detect_netplan_renderer)\n\nIf using NetworkManager, ensure it is installed and running.\nOtherwise install iw for basic scan support."
     return 1
   fi
 
@@ -549,34 +655,42 @@ menu_wifi_pick_network() {
 }
 
 menu_configure_wifi() {
-  local iface choice ssid password security hidden addr netmask prefix file
+  local iface choice ssid password security hidden addr netmask prefix file body
   iface=$(iface_menu_pick "Wi-Fi interface" wireless) || return 0
 
   if ! command -v nmcli >/dev/null 2>&1 && ! command -v iw >/dev/null 2>&1; then
-    ui_msg "Wi-Fi tools missing" "Install NetworkManager (nmcli) or iw before configuring Wi-Fi."
+    ui_msg "Wi-Fi tools missing" "Install nmcli (NetworkManager) or iw before configuring Wi-Fi."
     return 0
   fi
 
   while true; do
-    choice=$(ui_menu "Wi-Fi: ${iface}" "Choose an action:" \
-      scan "Scan and connect" \
-      manual "Connect to hidden/custom SSID" \
-      dhcp "Reconnect saved SSID with DHCP" \
-      static "Reconnect saved SSID with static IP" \
-      up "Bring interface up" \
-      down "Bring interface down" \
-      status "Show status" \
+    body=$(iface_menu_body "$iface" "Wi-Fi")
+    choice=$(ui_menu "Wi-Fi: ${iface}" "$body" \
+      scan "Scan and Connect" \
+      manual "Connect to Hidden/Custom SSID" \
+      dhcp "Reconnect Saved SSID (DHCP)" \
+      static "Reconnect Saved SSID (Static IP)" \
+      up "Bring Interface Up" \
+      down "Bring Interface Down" \
+      renew "Renew DHCP Lease" \
+      status "Show Detailed Status" \
       back "Back") || return 0
 
     case "$choice" in
       scan)
         ssid=$(menu_wifi_pick_network "$iface") || continue
         [[ -n "$ssid" ]] || continue
-        security=$(timeout 10 nmcli -t -f SSID,SECURITY dev wifi list ifname "$iface" 2>/dev/null | awk -F: -v s="$ssid" '$1==s{print $2; exit}')
+        if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
+          security=$(timeout 10 nmcli -t -f SSID,SECURITY dev wifi list ifname "$iface" 2>/dev/null | awk -F: -v s="$ssid" '$1==s{print $2; exit}')
+        else
+          security=""
+        fi
         if [[ -n "$security" && "$security" != "--" ]]; then
           password=$(ui_password "Wi-Fi password" "Password for ${ssid}:") || continue
         else
-          password=""
+          ui_yesno "Wi-Fi security" "Does ${ssid} require a password?" && {
+            password=$(ui_password "Wi-Fi password" "Password for ${ssid}:") || continue
+          } || password=""
         fi
         write_netplan_wifi "$iface" "$ssid" "$password"
         apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
@@ -662,11 +776,13 @@ menu_configure_wifi() {
         ;;
       up)
         ip_link_set "$iface" up
-        ui_msg "Interface up" "${iface} is up."
         ;;
       down)
         ip_link_set "$iface" down
-        ui_msg "Interface down" "${iface} is down."
+        ;;
+      renew)
+        renew_dhcp_lease "$iface"
+        ui_msg "DHCP renewed" "Requested DHCP renewal on ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
         ;;
       status)
         iface_status_text "$iface"
@@ -760,9 +876,9 @@ Interactive menu:
 
 Notes:
 - Settings persist in /etc/netplan/${FILE_PREFIX}-IFACE.yaml
-- Wi-Fi uses netplan wifis + NetworkManager renderer
+- Auto-detects netplan renderer: NetworkManager or networkd
 - Menu uses dialog or whiptail (install one if missing)
-- Uses iproute2 (ip) only; netplan + nmcli/iw for Wi-Fi scan
+- Uses iproute2 (ip) only; nmcli or iw for Wi-Fi scan
 USAGE
 }
 
