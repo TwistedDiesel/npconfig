@@ -15,6 +15,103 @@ UI_BIN=""
 NETPLAN_RENDERER=""
 NETPLAN_LAST_LOG=""
 NP_LOG_DIR=/var/log/npconfig
+NP_SESSION_LOG=""
+NP_XTRACE_FD=""
+
+log_init() {
+  mkdir -p "$NP_LOG_DIR"
+  NP_SESSION_LOG="${NP_LOG_DIR}/session-$(date +%Y%m%d-%H%M%S)-$$.log"
+  ln -sfn "$(basename "$NP_SESSION_LOG")" "${NP_LOG_DIR}/latest.log"
+  NETPLAN_LAST_LOG="$NP_SESSION_LOG"
+
+  {
+    echo "=== npconfig session $(date -Is) pid=$$ ==="
+    echo "argv: $(printf '%q ' "$@")"
+    echo "hostname: $(hostname 2>/dev/null || true)"
+    echo "id: $(id 2>/dev/null || true)"
+    echo "npconfig: $(command -v npconfig 2>/dev/null || echo unknown)"
+    echo "log: ${NP_SESSION_LOG}"
+    echo "--- uname ---"
+    uname -a 2>/dev/null || true
+    echo "--- /etc/netplan ---"
+    ls -la "${NETPLAN_DIR}/" 2>/dev/null || true
+    echo "---"
+  } >>"$NP_SESSION_LOG"
+
+  # Trace every command to the log file only (does not break whiptail/dialog).
+  NP_XTRACE_FD=19
+  exec 19>>"$NP_SESSION_LOG"
+  export BASH_XTRACEFD=19
+  export PS4='+ [$(date +%H:%M:%S)] ${BASH_SOURCE##*/}:${LINENO}: '
+  set -x
+}
+
+log_section() {
+  [[ -n "${NP_SESSION_LOG:-}" ]] || return 0
+  {
+    echo
+    echo "########## $* ##########"
+    echo "time: $(date -Is)"
+  } >>"$NP_SESSION_LOG"
+}
+
+log_write_file() {
+  local title="$1" file="$2"
+  [[ -n "${NP_SESSION_LOG:-}" && -f "$file" ]] || return 0
+  {
+    echo
+    echo "=== ${title}: ${file} ==="
+    cat "$file"
+    echo "=== end ${file} ==="
+  } >>"$NP_SESSION_LOG"
+}
+
+log_cmd() {
+  local title="$1"
+  shift
+  [[ -n "${NP_SESSION_LOG:-}" ]] || { "$@"; return $?; }
+  {
+    echo
+    echo ">>> ${title}"
+    echo ">>> exec: $(printf '%q ' "$@")"
+    echo ">>> start: $(date -Is)"
+  } >>"$NP_SESSION_LOG"
+  set +e
+  "$@" >>"$NP_SESSION_LOG" 2>&1
+  local rc=$?
+  set -e
+  {
+    echo ">>> exit: ${rc}"
+    echo ">>> end: $(date -Is)"
+  } >>"$NP_SESSION_LOG"
+  return "$rc"
+}
+
+log_cmd_to() {
+  local title="$1" outfile="$2"
+  shift 2
+  [[ -n "${NP_SESSION_LOG:-}" ]] || { "$@" >"$outfile"; return $?; }
+  {
+    echo
+    echo ">>> ${title}"
+    echo ">>> exec: $(printf '%q ' "$@")"
+    echo ">>> outfile: ${outfile}"
+    echo ">>> start: $(date -Is)"
+  } >>"$NP_SESSION_LOG"
+  set +e
+  "$@" >"$outfile" 2>>"$NP_SESSION_LOG"
+  local rc=$?
+  set -e
+  {
+    echo ">>> exit: ${rc}"
+    echo ">>> end: $(date -Is)"
+    if [[ -f "$outfile" ]]; then
+      echo ">>> captured ($(wc -c <"$outfile") bytes):"
+      cat "$outfile"
+    fi
+  } >>"$NP_SESSION_LOG"
+  return "$rc"
+}
 
 has_unit_file() {
   systemctl list-unit-files "$1" 2>/dev/null | grep -q "^$1"
@@ -92,6 +189,7 @@ network:
       dhcp4: true
 YAML
   secure_netplan_file "$file"
+  log_write_file "write_netplan_dhcp ${iface}" "$file"
 }
 
 write_netplan_static() {
@@ -123,6 +221,7 @@ network:
           - ${dns2}
 YAML
   secure_netplan_file "$file"
+  log_write_file "write_netplan_static ${iface}" "$file"
 }
 
 write_netplan_wifi() {
@@ -177,6 +276,7 @@ $(networkd_wifi_extra_yaml)${ap_block}
           - ${dns2}
 YAML
     secure_netplan_file "$file"
+    log_write_file "write_netplan_wifi static ${iface}" "$file"
   else
     cat >"$file" <<YAML
 network:
@@ -188,6 +288,7 @@ network:
 $(networkd_wifi_extra_yaml)${ap_block}
 YAML
     secure_netplan_file "$file"
+    log_write_file "write_netplan_wifi dhcp ${iface}" "$file"
   fi
 }
 
@@ -282,13 +383,13 @@ netplan_file_for() {
 
 secure_netplan_file() {
   local file="$1"
-  chown root:root "$file"
-  chmod 600 "$file"
+  log_cmd "chown root:root ${file}" chown root:root "$file"
+  log_cmd "chmod 600 ${file}" chmod 600 "$file"
 }
 
 ip_link_set() {
   local iface="$1" state="$2"
-  ip link set dev "$iface" "$state"
+  log_cmd "ip link set ${iface} ${state}" ip link set dev "$iface" "$state"
 }
 
 format_iface_show() {
@@ -351,12 +452,15 @@ show_wifi_status() {
 
 wifi_prepare_iface() {
   local iface="$1"
-  command -v rfkill >/dev/null 2>&1 && rfkill unblock wifi >/dev/null 2>&1 || true
-  ip link set dev "$iface" up 2>/dev/null || true
+  log_section "wifi_prepare_iface ${iface}"
+  if command -v rfkill >/dev/null 2>&1; then
+    log_cmd "rfkill unblock wifi" rfkill unblock wifi
+  fi
+  log_cmd "ip link set ${iface} up" ip link set dev "$iface" up
   if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
-    nmcli radio wifi on >/dev/null 2>&1 || true
-    nmcli dev set "$iface" managed yes >/dev/null 2>&1 || true
-    timeout 20 nmcli dev wifi rescan ifname "$iface" >/dev/null 2>&1 || true
+    log_cmd "nmcli radio wifi on" nmcli radio wifi on
+    log_cmd "nmcli dev set ${iface} managed yes" nmcli dev set "$iface" managed yes
+    log_cmd "nmcli dev wifi rescan ${iface}" timeout 20 nmcli dev wifi rescan ifname "$iface"
   fi
 }
 
@@ -367,8 +471,10 @@ wifi_scan_wpa_supplicant() {
   command -v wpa_supplicant >/dev/null 2>&1 || return 1
   command -v wpa_cli >/dev/null 2>&1 || return 1
 
+  log_section "wifi_scan_wpa_supplicant ${iface}"
+
   if [[ -S "/run/wpa_supplicant/${iface}" ]] || [[ -S "/var/run/wpa_supplicant/${iface}" ]]; then
-    wpa_cli -i "$iface" scan >/dev/null 2>&1 || return 1
+    log_cmd "wpa_cli scan ${iface}" wpa_cli -i "$iface" scan || return 1
   else
     conf=$(mktemp)
     cat >"$conf" <<EOF
@@ -376,18 +482,20 @@ ctrl_interface=/run/npconfig-wpa
 update_config=0
 ap_scan=1
 EOF
+    log_write_file "wpa scan conf" "$conf"
     mkdir -p /run/npconfig-wpa
     chmod 755 /run/npconfig-wpa
-    if ! wpa_supplicant -B -i "$iface" -c "$conf" -D nl80211,wext -P "$pidfile" 2>/dev/null; then
+    if ! log_cmd "wpa_supplicant scan daemon ${iface}" wpa_supplicant -B -i "$iface" -c "$conf" -D nl80211,wext -P "$pidfile"; then
       rm -f "$conf"
       return 1
     fi
     started=1
     sleep 2
-    wpa_cli -i "$iface" scan >/dev/null 2>&1 || true
+    log_cmd "wpa_cli scan ${iface}" wpa_cli -i "$iface" scan || true
   fi
 
   sleep 4
+  log_cmd "wpa_cli scan_results ${iface}" wpa_cli -i "$iface" scan_results
   wpa_cli -i "$iface" scan_results 2>/dev/null | awk '
     NR > 1 && $5 != "" {
       ssid=$5
@@ -395,9 +503,10 @@ EOF
       if (ssid != "") printf ":%s:open:%s\n", ssid, $3
     }
   ' >"$outfile"
+  log_write_file "wifi scan results ${iface}" "$outfile"
 
   if [[ $started -eq 1 && -f "$pidfile" ]]; then
-    kill "$(cat "$pidfile")" 2>/dev/null || true
+    log_cmd "kill wpa_supplicant scan pid" kill "$(cat "$pidfile")"
     rm -f "$pidfile" "$conf"
   fi
 
@@ -406,11 +515,15 @@ EOF
 
 wifi_scan_to_file() {
   local iface="$1" outfile="$2"
+  log_section "wifi_scan_to_file ${iface}"
   wifi_prepare_iface "$iface"
 
   if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
-    timeout 20 nmcli -t -f IN-USE,SSID,SECURITY,SIGNAL dev wifi list ifname "$iface" >"$outfile" 2>/dev/null \
-      && [[ -s "$outfile" ]] && return 0
+    if log_cmd_to "nmcli dev wifi list ${iface}" "$outfile" \
+      timeout 20 nmcli -t -f IN-USE,SSID,SECURITY,SIGNAL dev wifi list ifname "$iface"; then
+      log_write_file "wifi scan results ${iface}" "$outfile"
+      [[ -s "$outfile" ]] && return 0
+    fi
   fi
 
   if wifi_scan_wpa_supplicant "$iface" "$outfile"; then
@@ -418,15 +531,22 @@ wifi_scan_to_file() {
   fi
 
   if command -v iw >/dev/null 2>&1; then
-    timeout 25 iw dev "$iface" scan 2>/dev/null | awk '
-      /^BSS / {bssid=$2; sig=""}
-      /signal:/ {sig=$2}
-      /SSID:/ {
-        ssid=substr($0, index($0,":")+2)
-        if (ssid != "") printf ":%s:open:%s\n", ssid, sig
-      }
-    ' >"$outfile"
-    [[ -s "$outfile" ]] && return 0
+    local iw_tmp
+    iw_tmp=$(mktemp)
+    if log_cmd_to "iw dev ${iface} scan" "$iw_tmp" timeout 25 iw dev "$iface" scan; then
+      awk '
+        /^BSS / {bssid=$2; sig=""}
+        /signal:/ {sig=$2}
+        /SSID:/ {
+          ssid=substr($0, index($0,":")+2)
+          if (ssid != "") printf ":%s:open:%s\n", ssid, sig
+        }
+      ' "$iw_tmp" >"$outfile"
+      log_write_file "iw scan results ${iface}" "$outfile"
+      rm -f "$iw_tmp"
+      [[ -s "$outfile" ]] && return 0
+    fi
+    rm -f "$iw_tmp"
   fi
 
   return 1
@@ -618,6 +738,11 @@ append_backend_logs() {
     echo
     echo "=== journal: wpa_supplicant (last 30) ==="
     journalctl -u wpa_supplicant@"*" -n 30 --no-pager 2>&1 || journalctl -t wpa_supplicant -n 30 --no-pager 2>&1 || true
+    if uses_network_manager; then
+      echo
+      echo "=== journal: NetworkManager (last 30) ==="
+      journalctl -u NetworkManager -n 30 --no-pager 2>&1 || true
+    fi
     echo
     echo "=== merged netplan (netplan get) ==="
     netplan get 2>&1 | head -100 || true
@@ -625,53 +750,54 @@ append_backend_logs() {
 }
 
 apply_netplan() {
-  local f log rc=0
-  mkdir -p "$NP_LOG_DIR"
-  log=$(mktemp "${NP_LOG_DIR}/apply.XXXXXX")
-  NETPLAN_LAST_LOG="$log"
+  log_section "netplan apply"
+  local f rc=0
+  NETPLAN_LAST_LOG="$NP_SESSION_LOG"
 
   {
-    echo "=== npconfig netplan apply $(date -Is) ==="
     echo "renderer: $(detect_netplan_renderer)"
     echo
     echo "=== /etc/netplan files ==="
     list_netplan_files | sed 's/^/  /'
     echo
-  } >"$log"
+  } >>"$NP_SESSION_LOG"
 
   shopt -s nullglob
   for f in "${NETPLAN_DIR}/${FILE_PREFIX}-"*.yaml; do
     secure_netplan_file "$f"
+    log_write_file "netplan overlay ${f}" "$f"
   done
 
-  {
-    echo "=== netplan generate ==="
-    netplan generate
-  } >>"$log" 2>&1 || rc=1
+  if ! log_cmd "netplan generate" netplan generate; then
+    rc=1
+  fi
 
   if [[ $rc -eq 0 ]]; then
-    {
-      echo
-      echo "=== netplan apply --debug ==="
-      timeout 90 netplan apply --debug
-    } >>"$log" 2>&1 || rc=1
+    if ! log_cmd "netplan apply --debug" timeout 90 netplan apply --debug; then
+      rc=1
+    fi
   fi
 
   if [[ $rc -ne 0 ]]; then
-    append_backend_logs "$log"
+    append_backend_logs "$NP_SESSION_LOG"
     return 1
   fi
 
   {
     echo
     echo "=== apply succeeded ==="
-  } >>"$log"
+  } >>"$NP_SESSION_LOG"
   return 0
 }
 
 print_apply_error() {
   echo "npconfig: netplan apply failed." >&2
-  if [[ -n "$NETPLAN_LAST_LOG" && -f "$NETPLAN_LAST_LOG" ]]; then
+  if [[ -n "$NP_SESSION_LOG" && -f "$NP_SESSION_LOG" ]]; then
+    echo "npconfig: full session log: ${NP_SESSION_LOG}" >&2
+    echo "--- begin session log ---" >&2
+    cat "$NP_SESSION_LOG" >&2
+    echo "--- end session log ---" >&2
+  elif [[ -n "$NETPLAN_LAST_LOG" && -f "$NETPLAN_LAST_LOG" ]]; then
     echo "npconfig: full log: ${NETPLAN_LAST_LOG}" >&2
     echo "--- begin netplan log ---" >&2
     cat "$NETPLAN_LAST_LOG" >&2
@@ -732,42 +858,41 @@ dump_iface_netplan_detail() {
     cat "$f"
     echo
   done < <(list_netplan_files)
-  if [[ -n "$NETPLAN_LAST_LOG" && -f "$NETPLAN_LAST_LOG" ]]; then
-    echo "=== Last npconfig apply log ==="
-    cat "$NETPLAN_LAST_LOG"
+  if [[ -n "$NP_SESSION_LOG" && -f "$NP_SESSION_LOG" ]]; then
+    echo "=== npconfig session log ==="
+    cat "$NP_SESSION_LOG"
   fi
 }
 
 show_last_apply_log() {
-  local tmp
+  local tmp log="${NP_SESSION_LOG:-}"
   tmp=$(mktemp)
-  if [[ -n "$NETPLAN_LAST_LOG" && -f "$NETPLAN_LAST_LOG" ]]; then
-    cat "$NETPLAN_LAST_LOG" >"$tmp"
-  else
-    local latest
-    latest=$(ls -1t "${NP_LOG_DIR}"/apply.* 2>/dev/null | head -1 || true)
-    if [[ -n "$latest" ]]; then
-      cat "$latest" >"$tmp"
-    else
-      echo "No apply logs found in ${NP_LOG_DIR}" >"$tmp"
-    fi
+  if [[ -z "$log" || ! -f "$log" ]]; then
+    log="${NP_LOG_DIR}/latest.log"
+    [[ -e "$log" ]] && log=$(readlink -f "$log" 2>/dev/null || echo "$log")
   fi
-  ui_textbox "Netplan apply log" "$tmp"
+  if [[ -f "$log" ]]; then
+    cat "$log" >"$tmp"
+  else
+    echo "No session logs found in ${NP_LOG_DIR}" >"$tmp"
+  fi
+  ui_textbox "npconfig session log" "$tmp"
   rm -f "$tmp"
 }
 
 renew_dhcp_lease() {
   local iface="$1"
+  log_section "renew_dhcp_lease ${iface}"
   if command -v networkctl >/dev/null 2>&1; then
-    networkctl renew "$iface" >/dev/null 2>&1 && return 0
+    log_cmd "networkctl renew ${iface}" networkctl renew "$iface" && return 0
   fi
   if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
-    nmcli device reapply "$iface" >/dev/null 2>&1 && return 0
-    nmcli device connect "$iface" >/dev/null 2>&1 && return 0
+    log_cmd "nmcli device reapply ${iface}" nmcli device reapply "$iface" && return 0
+    log_cmd "nmcli device connect ${iface}" nmcli device connect "$iface" && return 0
   fi
   if command -v dhclient >/dev/null 2>&1; then
-    dhclient -r "$iface" >/dev/null 2>&1 || true
-    dhclient "$iface" >/dev/null 2>&1 && return 0
+    log_cmd "dhclient -r ${iface}" dhclient -r "$iface" || true
+    log_cmd "dhclient ${iface}" dhclient "$iface" && return 0
   fi
   apply_netplan
 }
@@ -1216,7 +1341,7 @@ menu_main() {
       status "Show one interface" \
       all "Show all interfaces" \
       netplan "View all netplan files" \
-      log "Show last apply log" \
+      log "Show session log" \
       apply "Apply netplan now" \
       quit "Exit") || exit 0
 
@@ -1274,6 +1399,7 @@ Notes:
 - Wi-Fi on server uses stock networkd + wpa_supplicant; scan via wpa_cli when available
 - Menu uses dialog or whiptail (install one if missing)
 - Uses iproute2 (ip) only; no extra packages required on stock Ubuntu
+- Full session logging: ${NP_LOG_DIR}/session-*.log (symlink: ${NP_LOG_DIR}/latest.log)
 USAGE
 }
 
@@ -1373,6 +1499,8 @@ parse_wifi_args() {
     ip_link_set "$iface" up || true
   fi
 }
+
+log_init "$@"
 
 if [[ $# -eq 0 ]]; then
   show_all
