@@ -26,6 +26,18 @@ detect_netplan_renderer() {
     return 0
   fi
 
+  # Prefer the backend that is actually running (server = networkd, desktop = NM).
+  if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    NETPLAN_RENDERER="NetworkManager"
+    printf '%s' "$NETPLAN_RENDERER"
+    return 0
+  fi
+  if systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+    NETPLAN_RENDERER="networkd"
+    printf '%s' "$NETPLAN_RENDERER"
+    return 0
+  fi
+
   local hinted=""
   hinted=$(grep -rh '^[[:space:]]*renderer:' "${NETPLAN_DIR}/"*.yaml 2>/dev/null | head -1 | awk '{print $2}' || true)
   if [[ "$hinted" == "NetworkManager" || "$hinted" == "networkd" ]]; then
@@ -43,7 +55,14 @@ detect_netplan_renderer() {
 }
 
 uses_network_manager() {
-  [[ "$(detect_netplan_renderer)" == "NetworkManager" ]]
+  [[ "$(detect_netplan_renderer)" == "NetworkManager" ]] \
+    && systemctl is-active --quiet NetworkManager 2>/dev/null
+}
+
+networkd_wifi_extra_yaml() {
+  if [[ "$(detect_netplan_renderer)" == "networkd" ]]; then
+    printf '      optional: true\n      dhcp6: false\n'
+  fi
 }
 
 static_defaults_for_iface() {
@@ -146,7 +165,7 @@ network:
   wifis:
     ${iface}:
       dhcp4: false
-${ap_block}
+$(networkd_wifi_extra_yaml)${ap_block}
       addresses:
         - ${addr}/${prefix}
       routes:
@@ -166,7 +185,7 @@ network:
   wifis:
     ${iface}:
       dhcp4: true
-${ap_block}
+$(networkd_wifi_extra_yaml)${ap_block}
 YAML
     secure_netplan_file "$file"
   fi
@@ -314,9 +333,11 @@ show_wifi_status() {
     fi
   fi
 
-  if command -v nmcli >/dev/null 2>&1; then
+  if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
     nmcli -t -f GENERAL.CONNECTION,GENERAL.STATE,IP4.ADDRESS device show "$iface" 2>/dev/null \
       | sed 's/^/wifi-/'
+  elif command -v networkctl >/dev/null 2>&1; then
+    networkctl status "$iface" 2>/dev/null | sed 's/^/wifi-/'
   fi
 
   file=$(netplan_file_for "$iface")
@@ -330,6 +351,7 @@ show_wifi_status() {
 
 wifi_prepare_iface() {
   local iface="$1"
+  command -v rfkill >/dev/null 2>&1 && rfkill unblock wifi >/dev/null 2>&1 || true
   ip link set dev "$iface" up 2>/dev/null || true
   if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
     nmcli radio wifi on >/dev/null 2>&1 || true
@@ -338,13 +360,61 @@ wifi_prepare_iface() {
   fi
 }
 
+wifi_scan_wpa_supplicant() {
+  local iface="$1" outfile="$2"
+  local conf pidfile=/run/npconfig-wpa-scan-${iface}.pid started=0
+
+  command -v wpa_supplicant >/dev/null 2>&1 || return 1
+  command -v wpa_cli >/dev/null 2>&1 || return 1
+
+  if [[ -S "/run/wpa_supplicant/${iface}" ]] || [[ -S "/var/run/wpa_supplicant/${iface}" ]]; then
+    wpa_cli -i "$iface" scan >/dev/null 2>&1 || return 1
+  else
+    conf=$(mktemp)
+    cat >"$conf" <<EOF
+ctrl_interface=/run/npconfig-wpa
+update_config=0
+ap_scan=1
+EOF
+    mkdir -p /run/npconfig-wpa
+    chmod 755 /run/npconfig-wpa
+    if ! wpa_supplicant -B -i "$iface" -c "$conf" -D nl80211,wext -P "$pidfile" 2>/dev/null; then
+      rm -f "$conf"
+      return 1
+    fi
+    started=1
+    sleep 2
+    wpa_cli -i "$iface" scan >/dev/null 2>&1 || true
+  fi
+
+  sleep 4
+  wpa_cli -i "$iface" scan_results 2>/dev/null | awk '
+    NR > 1 && $5 != "" {
+      ssid=$5
+      sub(/^[[:space:]]+/, "", ssid)
+      if (ssid != "") printf ":%s:open:%s\n", ssid, $3
+    }
+  ' >"$outfile"
+
+  if [[ $started -eq 1 && -f "$pidfile" ]]; then
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile" "$conf"
+  fi
+
+  [[ -s "$outfile" ]]
+}
+
 wifi_scan_to_file() {
   local iface="$1" outfile="$2"
   wifi_prepare_iface "$iface"
 
-  if command -v nmcli >/dev/null 2>&1; then
-    timeout 20 nmcli -t -f IN-USE,SSID,SECURITY,SIGNAL dev wifi list ifname "$iface" >"$outfile" 2>/dev/null
-    return $?
+  if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
+    timeout 20 nmcli -t -f IN-USE,SSID,SECURITY,SIGNAL dev wifi list ifname "$iface" >"$outfile" 2>/dev/null \
+      && [[ -s "$outfile" ]] && return 0
+  fi
+
+  if wifi_scan_wpa_supplicant "$iface" "$outfile"; then
+    return 0
   fi
 
   if command -v iw >/dev/null 2>&1; then
@@ -356,10 +426,19 @@ wifi_scan_to_file() {
         if (ssid != "") printf ":%s:open:%s\n", ssid, sig
       }
     ' >"$outfile"
-    return $?
+    [[ -s "$outfile" ]] && return 0
   fi
 
   return 1
+}
+
+wifi_apply_result_text() {
+  local iface="$1" out
+  out=$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)
+  if command -v networkctl >/dev/null 2>&1; then
+    out="${out}"$'\n'"$(networkctl status "$iface" 2>/dev/null | sed -n '1,12p')"
+  fi
+  printf '%s' "$out"
 }
 
 wifi_scan() {
@@ -383,7 +462,7 @@ wifi_scan() {
     return 0
   fi
   rm -f "$tmp"
-  echo "npconfig: install nmcli or iw to scan Wi-Fi (NetworkManager recommended)" >&2
+  echo "npconfig: Wi-Fi scan unavailable; use manual SSID entry (npconfig IFACE wifi SSID ...)" >&2
   exit 1
 }
 
@@ -537,8 +616,8 @@ append_backend_logs() {
     echo "=== journal: systemd-networkd (last 30) ==="
     journalctl -u systemd-networkd -n 30 --no-pager 2>&1 || true
     echo
-    echo "=== journal: NetworkManager (last 30) ==="
-    journalctl -u NetworkManager -n 30 --no-pager 2>&1 || true
+    echo "=== journal: wpa_supplicant (last 30) ==="
+    journalctl -u wpa_supplicant@"*" -n 30 --no-pager 2>&1 || journalctl -t wpa_supplicant -n 30 --no-pager 2>&1 || true
     echo
     echo "=== merged netplan (netplan get) ==="
     netplan get 2>&1 | head -100 || true
@@ -945,7 +1024,7 @@ menu_wifi_pick_network() {
   ui_msg "Wi-Fi scan" "Scanning on ${iface}.\nThis may take up to 20 seconds."
   if ! wifi_scan_to_file "$iface" "$scan_file"; then
     rm -f "$scan_file" "$map_file"
-    ui_msg "Scan failed" "Could not scan Wi-Fi on ${iface}.\n\nBackend: $(detect_netplan_renderer)\n\nIf using NetworkManager, ensure it is installed and running.\nOtherwise install iw for basic scan support."
+    ui_msg "Scan failed" "Could not scan Wi-Fi on ${iface}.\n\nBackend: $(detect_netplan_renderer)\n\nUse \"Connect to Hidden/Custom SSID\" and enter the network name manually.\n\nStock Ubuntu server uses networkd + wpa_supplicant (no extra packages)."
     return 1
   fi
 
@@ -979,13 +1058,8 @@ menu_wifi_pick_network() {
 }
 
 menu_configure_wifi() {
-  local iface choice ssid password security hidden addr netmask prefix file body
+  local iface choice ssid password security hidden addr netmask prefix file body gateway dns1 dns2
   iface=$(iface_menu_pick "Wi-Fi interface" wireless) || return 0
-
-  if ! command -v nmcli >/dev/null 2>&1 && ! command -v iw >/dev/null 2>&1; then
-    ui_msg "Wi-Fi tools missing" "Install nmcli (NetworkManager) or iw before configuring Wi-Fi."
-    return 0
-  fi
 
   while true; do
     body=$(iface_menu_body "$iface" "Wi-Fi")
@@ -1021,7 +1095,8 @@ menu_configure_wifi() {
         write_netplan_wifi "$iface" "$ssid" "$password"
         apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
-        ui_msg "Applied" "Connected ${iface} to:\n${ssid}\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
+        sleep 3
+        ui_msg "Applied" "Connected ${iface} to:\n${ssid}\n\n$(wifi_apply_result_text "$iface")"
         ;;
       manual)
         hidden=0
@@ -1034,7 +1109,8 @@ menu_configure_wifi() {
         write_netplan_wifi "$iface" "$ssid" "$password" "" "" "$hidden"
         apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
-        ui_msg "Applied" "Configured ${iface} for SSID:\n${ssid}"
+        sleep 3
+        ui_msg "Applied" "Configured ${iface} for SSID:\n${ssid}\n\n$(wifi_apply_result_text "$iface")"
         ;;
       dhcp)
         if ! IFS=$'\t' read -r ssid password < <(read_wifi_credentials "$iface" 2>/dev/null); then
@@ -1194,9 +1270,10 @@ Interactive menu:
 
 Notes:
 - Settings persist in /etc/netplan/${FILE_PREFIX}-IFACE.yaml
-- Auto-detects netplan renderer: NetworkManager or networkd
+- Auto-detects netplan renderer: NetworkManager (desktop) or networkd (server)
+- Wi-Fi on server uses stock networkd + wpa_supplicant; scan via wpa_cli when available
 - Menu uses dialog or whiptail (install one if missing)
-- Uses iproute2 (ip) only; nmcli or iw for Wi-Fi scan
+- Uses iproute2 (ip) only; no extra packages required on stock Ubuntu
 USAGE
 }
 
