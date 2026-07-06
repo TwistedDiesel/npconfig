@@ -13,6 +13,8 @@ NETPLAN_DIR=/etc/netplan
 FILE_PREFIX=99-npconfig
 UI_BIN=""
 NETPLAN_RENDERER=""
+NETPLAN_LAST_LOG=""
+NP_LOG_DIR=/var/log/npconfig
 
 has_unit_file() {
   systemctl list-unit-files "$1" 2>/dev/null | grep -q "^$1"
@@ -263,6 +265,9 @@ show_all() {
 show_iface() {
   local iface="$1"
   format_iface_show "$iface"
+  echo
+  echo "=== netplan ($(netplan_iface_path "$iface")) ==="
+  netplan_merged_config_for_iface "$iface" 2>/dev/null || echo "(not in merged config)"
   if is_wireless "$iface"; then
     echo
     show_wifi_status "$iface"
@@ -287,16 +292,10 @@ show_wifi_status() {
 
   file=$(netplan_file_for "$iface")
   if [[ -f "$file" ]]; then
-    echo "wifi-netplan: $file"
-    awk '
-      /^[[:space:]]*access-points:/ {show=1}
-      show && /^[[:space:]]*"/ {
-        gsub(/^[[:space:]]*"/, "", $0)
-        gsub(/":.*/, "", $0)
-        print "wifi-config-ssid: " $0
-        exit
-      }
-    ' "$file" || true
+    echo "wifi-npconfig: $file"
+  fi
+  if IFS=$'\t' read -r ssid _ < <(read_wifi_credentials "$iface" 2>/dev/null) && [[ -n "$ssid" ]]; then
+    echo "wifi-config-ssid: $ssid"
   fi
 }
 
@@ -359,14 +358,294 @@ wifi_scan() {
   exit 1
 }
 
-apply_netplan() {
+netplan_iface_path() {
+  local iface="$1"
+  printf '%s.%s' "$(yaml_type "$iface")" "$iface"
+}
+
+list_netplan_files() {
   local f
+  shopt -s nullglob
+  for f in "${NETPLAN_DIR}"/*.yaml; do
+    echo "$f"
+  done
+}
+
+netplan_file_defines_iface() {
+  local file="$1" iface="$2"
+  [[ -f "$file" ]] || return 1
+  awk -v iface="$iface" '
+    /^[[:space:]]*(ethernets|wifis):[[:space:]]*$/ { in_types=1; next }
+    in_types && $0 ~ "^[[:space:]]*" iface ":[[:space:]]*$" { found=1 }
+    in_types && $0 ~ "^[[:space:]]*" iface ":[[:space:]]*" { found=1 }
+    END { exit !found }
+  ' "$file"
+}
+
+netplan_files_for_iface() {
+  local iface="$1" f
+  while IFS= read -r f; do
+    netplan_file_defines_iface "$f" "$iface" && echo "$f"
+  done < <(list_netplan_files)
+}
+
+netplan_get_value() {
+  local path="$1"
+  netplan get "$path" 2>/dev/null | sed 's/^"\(.*\)"$/\1/'
+}
+
+netplan_merged_config_for_iface() {
+  local iface="$1"
+  netplan get "$(netplan_iface_path "$iface")" 2>&1
+}
+
+netplan_config_mode_for_iface() {
+  local iface="$1" path dhcp addr
+  path=$(netplan_iface_path "$iface")
+  dhcp=$(netplan get "${path}.dhcp4" 2>/dev/null || true)
+  addr=$(netplan get "${path}.addresses.0" 2>/dev/null | tr -d '"' || true)
+  if [[ "$dhcp" == "true" ]]; then
+    echo "dhcp"
+  elif [[ -n "$addr" ]]; then
+    echo "static (${addr})"
+  elif netplan_file_defines_iface "$(netplan_file_for "$iface")" "$iface" 2>/dev/null \
+    || netplan_files_for_iface "$iface" | grep -q .; then
+    echo "defined (see netplan)"
+  else
+    echo "not configured"
+  fi
+}
+
+read_wifi_credentials() {
+  local iface="$1" f ssid password
+  f=$(netplan_file_for "$iface")
+  if [[ -f "$f" ]]; then
+    ssid=$(awk '
+      /^[[:space:]]*access-points:/ {show=1}
+      show && /^[[:space:]]*"/ {
+        gsub(/^[[:space:]]*"/, "", $0)
+        gsub(/":.*/, "", $0)
+        print $0
+        exit
+      }
+    ' "$f" 2>/dev/null || true)
+    password=$(awk '
+      /password:/ {
+        gsub(/^[[:space:]]*password:[[:space:]]*/, "", $0)
+        gsub(/^"/, "", $0)
+        gsub(/"$/, "", $0)
+        print $0
+        exit
+      }
+    ' "$f" 2>/dev/null || true)
+    if [[ -n "$ssid" ]]; then
+      printf '%s\t%s\n' "$ssid" "$password"
+      return 0
+    fi
+  fi
+
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    ssid=$(awk -v iface="$iface" '
+      $0 ~ "^[[:space:]]*" iface ":[[:space:]]*$" { in_iface=1; next }
+      in_iface && /^[[:space:]]*access-points:/ { show=1; next }
+      in_iface && /^[[:space:]]*[a-zA-Z0-9_.-]+:/ && !/access-points:/ { in_iface=0 }
+      show && /^[[:space:]]*"/ {
+        gsub(/^[[:space:]]*"/, "", $0)
+        gsub(/":.*/, "", $0)
+        print $0
+        exit
+      }
+    ' "$f" 2>/dev/null || true)
+    password=$(awk -v iface="$iface" '
+      $0 ~ "^[[:space:]]*" iface ":[[:space:]]*$" { in_iface=1; next }
+      in_iface && /password:/ {
+        gsub(/^[[:space:]]*password:[[:space:]]*/, "", $0)
+        gsub(/^"/, "", $0)
+        gsub(/"$/, "", $0)
+        print $0
+        exit
+      }
+    ' "$f" 2>/dev/null || true)
+    if [[ -n "$ssid" ]]; then
+      printf '%s\t%s\n' "$ssid" "$password"
+      return 0
+    fi
+  done < <(netplan_files_for_iface "$iface")
+
+  ssid=$(netplan get "wifis.${iface}.access-points" 2>/dev/null | head -1 | sed -n 's/^[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [[ -n "$ssid" ]]; then
+    password=$(netplan get "wifis.${iface}.access-points.\"${ssid}\".password" 2>/dev/null | tr -d '"' || true)
+    printf '%s\t%s\n' "$ssid" "$password"
+    return 0
+  fi
+  return 1
+}
+
+default_ipv4_for_iface() {
+  local iface="$1" cidr ip prefix
+  cidr=$(netplan get "$(netplan_iface_path "$iface").addresses.0" 2>/dev/null | tr -d '"' || true)
+  if [[ -z "$cidr" ]]; then
+    cidr=$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}' | head -1)
+  fi
+  [[ -n "$cidr" ]] || return 1
+  ip=${cidr%%/*}
+  prefix=${cidr##*/}
+  if [[ "$prefix" =~ ^[0-9]+$ ]]; then
+    printf '%s %s\n' "$ip" "$(prefix_to_mask "$prefix")"
+  else
+    printf '%s %s\n' "$ip" "255.255.255.0"
+  fi
+}
+
+append_backend_logs() {
+  local log="$1"
+  {
+    echo
+    echo "=== networkctl status ==="
+    networkctl status 2>&1 || true
+    echo
+    echo "=== journal: systemd-networkd (last 30) ==="
+    journalctl -u systemd-networkd -n 30 --no-pager 2>&1 || true
+    echo
+    echo "=== journal: NetworkManager (last 30) ==="
+    journalctl -u NetworkManager -n 30 --no-pager 2>&1 || true
+    echo
+    echo "=== merged netplan (netplan get) ==="
+    netplan get 2>&1 | head -100 || true
+  } >>"$log"
+}
+
+apply_netplan() {
+  local f log rc=0
+  mkdir -p "$NP_LOG_DIR"
+  log=$(mktemp "${NP_LOG_DIR}/apply.XXXXXX")
+  NETPLAN_LAST_LOG="$log"
+
+  {
+    echo "=== npconfig netplan apply $(date -Is) ==="
+    echo "renderer: $(detect_netplan_renderer)"
+    echo
+    echo "=== /etc/netplan files ==="
+    list_netplan_files | sed 's/^/  /'
+    echo
+  } >"$log"
+
   shopt -s nullglob
   for f in "${NETPLAN_DIR}/${FILE_PREFIX}-"*.yaml; do
     secure_netplan_file "$f"
   done
-  netplan generate
-  timeout 90 netplan apply
+
+  {
+    echo "=== netplan generate ==="
+    netplan generate
+  } >>"$log" 2>&1 || rc=1
+
+  if [[ $rc -eq 0 ]]; then
+    {
+      echo
+      echo "=== netplan apply --debug ==="
+      timeout 90 netplan apply --debug
+    } >>"$log" 2>&1 || rc=1
+  fi
+
+  if [[ $rc -ne 0 ]]; then
+    append_backend_logs "$log"
+    return 1
+  fi
+
+  {
+    echo
+    echo "=== apply succeeded ==="
+  } >>"$log"
+  return 0
+}
+
+print_apply_error() {
+  echo "npconfig: netplan apply failed." >&2
+  if [[ -n "$NETPLAN_LAST_LOG" && -f "$NETPLAN_LAST_LOG" ]]; then
+    echo "npconfig: full log: ${NETPLAN_LAST_LOG}" >&2
+    echo "--- begin netplan log ---" >&2
+    cat "$NETPLAN_LAST_LOG" >&2
+    echo "--- end netplan log ---" >&2
+  fi
+}
+
+show_apply_error_dialog() {
+  local tmp
+  tmp=$(mktemp)
+  {
+    echo "netplan apply failed."
+    echo
+    if [[ -n "$NETPLAN_LAST_LOG" && -f "$NETPLAN_LAST_LOG" ]]; then
+      cat "$NETPLAN_LAST_LOG"
+    else
+      echo "No log captured."
+    fi
+  } >"$tmp"
+  ui_textbox "Netplan apply failed" "$tmp"
+  rm -f "$tmp"
+}
+
+apply_netplan_or_show_error() {
+  if apply_netplan; then
+    return 0
+  fi
+  if [[ -n "$UI_BIN" ]]; then
+    show_apply_error_dialog
+  else
+    print_apply_error
+  fi
+  return 1
+}
+
+dump_iface_netplan_detail() {
+  local iface="$1" f
+  echo "=== Live interface ==="
+  format_iface_show "$iface" 2>/dev/null || true
+  echo
+  echo "=== Merged netplan ($(netplan_iface_path "$iface")) ==="
+  netplan_merged_config_for_iface "$iface" || true
+  echo
+  echo "=== Source files mentioning ${iface} ==="
+  if netplan_files_for_iface "$iface" | grep -q .; then
+    while IFS= read -r f; do
+      echo "--- ${f} ---"
+      cat "$f"
+      echo
+    done < <(netplan_files_for_iface "$iface")
+  else
+    echo "(no netplan source defines ${iface})"
+    echo
+  fi
+  echo "=== All /etc/netplan files ==="
+  while IFS= read -r f; do
+    echo "--- ${f} ---"
+    cat "$f"
+    echo
+  done < <(list_netplan_files)
+  if [[ -n "$NETPLAN_LAST_LOG" && -f "$NETPLAN_LAST_LOG" ]]; then
+    echo "=== Last npconfig apply log ==="
+    cat "$NETPLAN_LAST_LOG"
+  fi
+}
+
+show_last_apply_log() {
+  local tmp
+  tmp=$(mktemp)
+  if [[ -n "$NETPLAN_LAST_LOG" && -f "$NETPLAN_LAST_LOG" ]]; then
+    cat "$NETPLAN_LAST_LOG" >"$tmp"
+  else
+    local latest
+    latest=$(ls -1t "${NP_LOG_DIR}"/apply.* 2>/dev/null | head -1 || true)
+    if [[ -n "$latest" ]]; then
+      cat "$latest" >"$tmp"
+    else
+      echo "No apply logs found in ${NP_LOG_DIR}" >"$tmp"
+    fi
+  fi
+  ui_textbox "Netplan apply log" "$tmp"
+  rm -f "$tmp"
 }
 
 renew_dhcp_lease() {
@@ -414,22 +693,12 @@ iface_status_summary() {
   if is_wireless "$iface"; then
     ssid=$(iwgetid "$iface" -r 2>/dev/null || true)
     if [[ -z "$ssid" ]]; then
-      file=$(netplan_file_for "$iface")
-      if [[ -f "$file" ]]; then
-        ssid=$(awk '
-          /^[[:space:]]*access-points:/ {show=1}
-          show && /^[[:space:]]*"/ {
-            gsub(/^[[:space:]]*"/, "", $0)
-            gsub(/":.*/, "", $0)
-            print $0
-            exit
-          }
-        ' "$file" 2>/dev/null || true)
-      fi
+      IFS=$'\t' read -r ssid _ < <(read_wifi_credentials "$iface" 2>/dev/null || true)
     fi
     [[ -n "$ssid" ]] && printf '\nSSID   : %s' "$ssid"
   fi
 
+  printf '\nNetplan: %s' "$(netplan_config_mode_for_iface "$iface")"
   printf '\nBackend: %s' "$(detect_netplan_renderer)"
 }
 
@@ -523,38 +792,37 @@ iface_menu_pick() {
 }
 
 iface_status_text() {
-  local iface="$1" file tmp
+  local iface="$1" tmp
   tmp=$(mktemp)
   {
-    echo "=== ${iface} ==="
-    format_iface_show "$iface" 2>/dev/null || true
-    echo
     if is_wireless "$iface"; then
-      echo "=== Wi-Fi status ==="
+      echo "=== Wi-Fi runtime ==="
       show_wifi_status "$iface" 2>/dev/null || true
       echo
     fi
-    file=$(netplan_file_for "$iface")
-    if [[ -f "$file" ]]; then
-      echo "=== netplan (${file}) ==="
-      cat "$file"
-    else
-      echo "No npconfig netplan file for ${iface}."
-    fi
+    dump_iface_netplan_detail "$iface"
   } >"$tmp"
   ui_textbox "Interface ${iface}" "$tmp"
   rm -f "$tmp"
 }
 
 menu_static_ip_form() {
-  local title="$1"
-  local addr netmask
-  addr=$(ui_input "$title" "IPv4 address:" "192.168.1.50") || return 1
+  local title="$1" iface="${2:-}"
+  local addr netmask defaults
+  if [[ -n "$iface" ]]; then
+    defaults=$(default_ipv4_for_iface "$iface" 2>/dev/null || true)
+    if [[ -n "$defaults" ]]; then
+      read -r addr netmask <<<"$defaults"
+    fi
+  fi
+  [[ -z "${addr:-}" ]] && addr="192.168.1.50"
+  [[ -z "${netmask:-}" ]] && netmask="255.255.255.0"
+  addr=$(ui_input "$title" "IPv4 address:" "$addr") || return 1
   looks_like_ipv4 "$addr" || {
     ui_msg "Invalid IP" "That does not look like a valid IPv4 address."
     return 1
   }
-  netmask=$(ui_input "$title" "Netmask:" "255.255.255.0") || return 1
+  netmask=$(ui_input "$title" "Netmask:" "$netmask") || return 1
   looks_like_ipv4 "$netmask" || {
     ui_msg "Invalid netmask" "That does not look like a valid netmask."
     return 1
@@ -574,21 +842,23 @@ menu_configure_ethernet() {
       up "Bring Interface Up" \
       down "Bring Interface Down" \
       renew "Renew DHCP Lease" \
+      netplan "View Netplan Config" \
+      log "Show Last Apply Log" \
       status "Show Detailed Status" \
       back "Back") || return 0
 
     case "$choice" in
       dhcp)
         write_netplan_dhcp "$iface"
-        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
         ui_msg "Applied" "DHCP enabled for ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
         ;;
       static)
-        read -r addr netmask < <(menu_static_ip_form "Static IP: ${iface}") || continue
+        read -r addr netmask < <(menu_static_ip_form "Static IP: ${iface}" "$iface") || continue
         prefix=$(mask_to_prefix "$netmask")
         write_netplan_static "$iface" "$addr" "$prefix"
-        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
         ui_msg "Applied" "Static IP set on ${iface}:\n${addr}/${prefix}"
         ;;
@@ -601,6 +871,12 @@ menu_configure_ethernet() {
       renew)
         renew_dhcp_lease "$iface"
         ui_msg "DHCP renewed" "Requested DHCP renewal on ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
+        ;;
+      netplan)
+        iface_status_text "$iface"
+        ;;
+      log)
+        show_last_apply_log
         ;;
       status)
         iface_status_text "$iface"
@@ -673,6 +949,8 @@ menu_configure_wifi() {
       up "Bring Interface Up" \
       down "Bring Interface Down" \
       renew "Renew DHCP Lease" \
+      netplan "View Netplan Config" \
+      log "Show Last Apply Log" \
       status "Show Detailed Status" \
       back "Back") || return 0
 
@@ -693,7 +971,7 @@ menu_configure_wifi() {
           } || password=""
         fi
         write_netplan_wifi "$iface" "$ssid" "$password"
-        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
         ui_msg "Applied" "Connected ${iface} to:\n${ssid}\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
         ;;
@@ -706,71 +984,33 @@ menu_configure_wifi() {
           password=$(ui_password "Wi-Fi password" "Password for ${ssid}:") || continue
         } || password=""
         write_netplan_wifi "$iface" "$ssid" "$password" "" "" "$hidden"
-        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
         ui_msg "Applied" "Configured ${iface} for SSID:\n${ssid}"
         ;;
       dhcp)
-        file=$(netplan_file_for "$iface")
-        if [[ ! -f "$file" ]]; then
-          ui_msg "No saved SSID" "Configure Wi-Fi first using scan or manual connect."
+        if ! IFS=$'\t' read -r ssid password < <(read_wifi_credentials "$iface" 2>/dev/null); then
+          ui_msg "No saved SSID" "No Wi-Fi config found for ${iface} in netplan.\nUse scan/manual connect first."
           continue
         fi
-        ssid=$(awk '
-          /^[[:space:]]*access-points:/ {show=1}
-          show && /^[[:space:]]*"/ {
-            gsub(/^[[:space:]]*"/, "", $0)
-            gsub(/":.*/, "", $0)
-            print $0
-            exit
-          }
-        ' "$file")
-        password=$(awk '
-          /password:/ {
-            gsub(/^[[:space:]]*password:[[:space:]]*/, "", $0)
-            gsub(/^"/, "", $0)
-            gsub(/"$/, "", $0)
-            print $0
-            exit
-          }
-        ' "$file")
         [[ -n "$ssid" ]] || {
-          ui_msg "No saved SSID" "Could not read SSID from ${file}."
+          ui_msg "No saved SSID" "Could not read SSID from netplan for ${iface}."
           continue
         }
         write_netplan_wifi "$iface" "$ssid" "$password"
-        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
         ui_msg "Applied" "DHCP reapplied for ${ssid} on ${iface}."
         ;;
       static)
-        file=$(netplan_file_for "$iface")
-        [[ -f "$file" ]] || {
-          ui_msg "No saved SSID" "Configure Wi-Fi first."
+        if ! IFS=$'\t' read -r ssid password < <(read_wifi_credentials "$iface" 2>/dev/null); then
+          ui_msg "No saved SSID" "No Wi-Fi config found for ${iface} in netplan."
           continue
-        }
-        ssid=$(awk '
-          /^[[:space:]]*access-points:/ {show=1}
-          show && /^[[:space:]]*"/ {
-            gsub(/^[[:space:]]*"/, "", $0)
-            gsub(/":.*/, "", $0)
-            print $0
-            exit
-          }
-        ' "$file")
-        password=$(awk '
-          /password:/ {
-            gsub(/^[[:space:]]*password:[[:space:]]*/, "", $0)
-            gsub(/^"/, "", $0)
-            gsub(/"$/, "", $0)
-            print $0
-            exit
-          }
-        ' "$file")
-        read -r addr netmask < <(menu_static_ip_form "Static Wi-Fi: ${iface}") || continue
+        fi
+        read -r addr netmask < <(menu_static_ip_form "Static Wi-Fi: ${iface}" "$iface") || continue
         prefix=$(mask_to_prefix "$netmask")
         write_netplan_wifi "$iface" "$ssid" "$password" "$addr" "$prefix"
-        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
         ui_msg "Applied" "Static IP set on ${iface} for ${ssid}:\n${addr}/${prefix}"
         ;;
@@ -783,6 +1023,12 @@ menu_configure_wifi() {
       renew)
         renew_dhcp_lease "$iface"
         ui_msg "DHCP renewed" "Requested DHCP renewal on ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
+        ;;
+      netplan)
+        iface_status_text "$iface"
+        ;;
+      log)
+        show_last_apply_log
         ;;
       status)
         iface_status_text "$iface"
@@ -803,6 +1049,13 @@ menu_show_all_status() {
     echo
     echo "=== addresses ==="
     ip -br addr show
+    echo
+    echo "=== all netplan files ==="
+    while IFS= read -r f; do
+      echo "--- ${f} ---"
+      cat "$f"
+      echo
+    done < <(list_netplan_files)
   } >"$tmp" 2>&1 || true
   ui_textbox "All interfaces" "$tmp"
   rm -f "$tmp"
@@ -816,12 +1069,14 @@ menu_show_one_status() {
 
 menu_apply_netplan() {
   if ui_yesno "Apply netplan" "Regenerate and apply all netplan configuration now?"; then
-    apply_netplan
-    ui_msg "Done" "netplan apply completed."
+    if apply_netplan_or_show_error; then
+      ui_msg "Done" "netplan apply completed."
+    fi
   fi
 }
 
 menu_main() {
+  local choice tmp
   [[ -t 0 ]] || {
     echo "npconfig menu requires an interactive terminal." >&2
     exit 1
@@ -831,11 +1086,13 @@ menu_main() {
   set +e
 
   while true; do
-    choice=$(ui_menu "npconfig" "Network setup menu\nWrites ${NETPLAN_DIR}/${FILE_PREFIX}-IFACE.yaml" \
+    choice=$(ui_menu "npconfig" "Network setup menu\nReads all ${NETPLAN_DIR}/*.yaml\nWrites ${FILE_PREFIX}-IFACE.yaml overlays" \
       ethernet "Configure Ethernet" \
       wifi "Configure Wi-Fi" \
       status "Show one interface" \
       all "Show all interfaces" \
+      netplan "View all netplan files" \
+      log "Show last apply log" \
       apply "Apply netplan now" \
       quit "Exit") || exit 0
 
@@ -844,6 +1101,19 @@ menu_main() {
       wifi) menu_configure_wifi ;;
       status) menu_show_one_status ;;
       all) menu_show_all_status ;;
+      netplan)
+        tmp=$(mktemp)
+        {
+          while IFS= read -r f; do
+            echo "=== ${f} ==="
+            cat "$f"
+            echo
+          done < <(list_netplan_files)
+        } >"$tmp" 2>&1
+        ui_textbox "All netplan files" "$tmp"
+        rm -f "$tmp"
+        ;;
+      log) show_last_apply_log ;;
       apply) menu_apply_netplan ;;
       quit) exit 0 ;;
     esac
@@ -973,7 +1243,7 @@ parse_wifi_args() {
     write_netplan_wifi "$iface" "$ssid" "$password" "$addr" "$prefix" "$hidden"
   fi
 
-  apply_netplan
+  apply_netplan_or_show_error || exit 1
   if [[ $bring_up -eq 1 ]]; then
     ip_link_set "$iface" up || true
   fi
@@ -1025,7 +1295,7 @@ fi
 
 if [[ $# -ge 2 && "$1" == "inet" && "$2" == "dhcp" ]]; then
   write_netplan_dhcp "$iface"
-  apply_netplan
+  apply_netplan_or_show_error || exit 1
   exit 0
 fi
 
@@ -1071,7 +1341,7 @@ done
 [[ -n "$netmask" ]] || { echo "npconfig: netmask is required for static IPv4" >&2; exit 2; }
 prefix=$(mask_to_prefix "$netmask")
 write_netplan_static "$iface" "$addr" "$prefix"
-apply_netplan
+apply_netplan_or_show_error || exit 1
 
 if [[ $bring_up -eq 1 ]]; then
   ip_link_set "$iface" up
