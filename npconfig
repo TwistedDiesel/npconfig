@@ -1,0 +1,865 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# npconfig: ifconfig-style CLI that persists interface settings through netplan.
+# Includes Wi-Fi provisioning and an interactive curses menu for headless setup.
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  echo "npconfig must run as root (or via sudo)." >&2
+  exit 1
+fi
+
+NETPLAN_DIR=/etc/netplan
+FILE_PREFIX=99-npconfig
+UI_BIN=""
+
+is_wireless() {
+  local iface="$1"
+  [[ -d "/sys/class/net/${iface}/wireless" ]] || [[ -L "/sys/class/net/${iface}/phy80211" ]]
+}
+
+yaml_type() {
+  local iface="$1"
+  if is_wireless "$iface"; then
+    echo "wifis"
+  else
+    echo "ethernets"
+  fi
+}
+
+yaml_quote() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
+mask_to_prefix() {
+  local m="$1"
+  local IFS=.
+  local o c=0
+  read -r o1 o2 o3 o4 <<< "$m"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    case "$o" in
+      255) c=$((c + 8));;
+      254) c=$((c + 7));;
+      252) c=$((c + 6));;
+      248) c=$((c + 5));;
+      240) c=$((c + 4));;
+      224) c=$((c + 3));;
+      192) c=$((c + 2));;
+      128) c=$((c + 1));;
+      0) ;;
+      *)
+        echo "Invalid netmask: $m" >&2
+        exit 2
+        ;;
+    esac
+  done
+  echo "$c"
+}
+
+prefix_to_mask() {
+  local p="$1"
+  local mask=""
+  local i o
+  for ((i = 0; i < 4; i++)); do
+    if ((p >= 8)); then
+      o=255
+      p=$((p - 8))
+    elif ((p > 0)); then
+      o=$((256 - (1 << (8 - p))))
+      p=0
+    else
+      o=0
+    fi
+    mask+="${o}"
+    ((i < 3)) && mask+="."
+  done
+  echo "$mask"
+}
+
+looks_like_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+iface_exists() {
+  [[ -d "/sys/class/net/$1" ]]
+}
+
+is_virtual_iface() {
+  local iface="$1"
+  case "$iface" in
+    lo|docker*|veth*|br-*|virbr*|tailscale*|vet*|tun*|tap*|wg*|zt*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+netplan_file_for() {
+  local iface="$1"
+  echo "${NETPLAN_DIR}/${FILE_PREFIX}-${iface}.yaml"
+}
+
+write_netplan_dhcp() {
+  local iface="$1"
+  local ytype
+  ytype=$(yaml_type "$iface")
+  local file
+  file=$(netplan_file_for "$iface")
+
+  cat >"$file" <<YAML
+network:
+  version: 2
+  renderer: NetworkManager
+  ${ytype}:
+    ${iface}:
+      dhcp4: true
+YAML
+}
+
+write_netplan_static() {
+  local iface="$1" addr="$2" prefix="$3"
+  local ytype
+  ytype=$(yaml_type "$iface")
+  local file
+  file=$(netplan_file_for "$iface")
+
+  cat >"$file" <<YAML
+network:
+  version: 2
+  renderer: NetworkManager
+  ${ytype}:
+    ${iface}:
+      dhcp4: false
+      addresses:
+        - ${addr}/${prefix}
+      routes: []
+      nameservers: {}
+YAML
+}
+
+write_netplan_wifi() {
+  local iface="$1" ssid="$2" password="${3:-}" addr="${4:-}" prefix="${5:-}" hidden="${6:-0}"
+  local file quoted_ssid ap_block
+  file=$(netplan_file_for "$iface")
+  quoted_ssid=$(yaml_quote "$ssid")
+
+  if [[ -n "$password" ]]; then
+    ap_block=$(cat <<YAML
+      access-points:
+        ${quoted_ssid}:
+          password: $(yaml_quote "$password")
+YAML
+)
+  else
+    ap_block=$(cat <<YAML
+      access-points:
+        ${quoted_ssid}: {}
+YAML
+)
+  fi
+
+  if [[ "$hidden" == "1" ]]; then
+    ap_block="${ap_block}
+          hidden: true"
+  fi
+
+  if [[ -n "$addr" && -n "$prefix" ]]; then
+    cat >"$file" <<YAML
+network:
+  version: 2
+  renderer: NetworkManager
+  wifis:
+    ${iface}:
+      dhcp4: false
+${ap_block}
+      addresses:
+        - ${addr}/${prefix}
+      routes: []
+      nameservers: {}
+YAML
+  else
+    cat >"$file" <<YAML
+network:
+  version: 2
+  renderer: NetworkManager
+  wifis:
+    ${iface}:
+      dhcp4: true
+${ap_block}
+YAML
+  fi
+}
+
+show_all() {
+  ifconfig -a
+}
+
+show_iface() {
+  local iface="$1"
+  ifconfig "$iface"
+  if is_wireless "$iface"; then
+    echo
+    show_wifi_status "$iface"
+  fi
+}
+
+show_wifi_status() {
+  local iface="$1"
+  local ssid file
+
+  if command -v iwgetid >/dev/null 2>&1; then
+    ssid=$(iwgetid "$iface" -r 2>/dev/null || true)
+    if [[ -n "$ssid" ]]; then
+      echo "wifi-ssid: $ssid"
+    fi
+  fi
+
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli -t -f GENERAL.CONNECTION,GENERAL.STATE,IP4.ADDRESS device show "$iface" 2>/dev/null \
+      | sed 's/^/wifi-/'
+  fi
+
+  file=$(netplan_file_for "$iface")
+  if [[ -f "$file" ]]; then
+    echo "wifi-netplan: $file"
+    awk '
+      /^[[:space:]]*access-points:/ {show=1}
+      show && /^[[:space:]]*"/ {
+        gsub(/^[[:space:]]*"/, "", $0)
+        gsub(/":.*/, "", $0)
+        print "wifi-config-ssid: " $0
+        exit
+      }
+    ' "$file" || true
+  fi
+}
+
+wifi_scan() {
+  local iface="$1"
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli dev wifi list ifname "$iface"
+    return 0
+  fi
+  if command -v iw >/dev/null 2>&1; then
+    iw dev "$iface" scan | awk '
+      /^BSS / {bssid=$2}
+      /SSID:/ {print bssid, substr($0, index($0,":")+2)}
+    '
+    return 0
+  fi
+  echo "npconfig: install nmcli or iw to scan Wi-Fi" >&2
+  exit 1
+}
+
+apply_netplan() {
+  netplan generate
+  netplan apply
+}
+
+ui_init() {
+  if command -v dialog >/dev/null 2>&1; then
+    UI_BIN=dialog
+    return 0
+  fi
+  if command -v whiptail >/dev/null 2>&1; then
+    UI_BIN=whiptail
+    return 0
+  fi
+  echo "npconfig: install dialog or whiptail for the interactive menu." >&2
+  exit 1
+}
+
+ui_msg() {
+  local title="$1" text="$2"
+  "$UI_BIN" --title "$title" --msgbox "$text" 12 72
+}
+
+ui_yesno() {
+  local title="$1" text="$2"
+  "$UI_BIN" --title "$title" --yesno "$text" 10 72
+}
+
+ui_input() {
+  local title="$1" prompt="$2" default="${3:-}"
+  local out
+  out=$("$UI_BIN" --title "$title" --inputbox "$prompt" 10 72 "$default" 3>&1 1>&2 2>&3) || return 1
+  printf '%s' "$out"
+}
+
+ui_password() {
+  local title="$1" prompt="$2"
+  local out
+  out=$("$UI_BIN" --title "$title" --passwordbox "$prompt" 10 72 3>&1 1>&2 2>&3) || return 1
+  printf '%s' "$out"
+}
+
+ui_menu() {
+  local title="$1" text="$2"
+  shift 2
+  "$UI_BIN" --title "$title" --menu "$text" 20 78 12 "$@" 3>&1 1>&2 2>&3
+}
+
+ui_textbox() {
+  local title="$1" file="$2"
+  "$UI_BIN" --title "$title" --textbox "$file" 22 78
+}
+
+list_physical_ifaces() {
+  local want="${1:-all}" iface
+  for iface in /sys/class/net/*; do
+    iface=$(basename "$iface")
+    is_virtual_iface "$iface" && continue
+    case "$want" in
+      wireless) is_wireless "$iface" || continue ;;
+      ethernet) is_wireless "$iface" && continue ;;
+    esac
+    echo "$iface"
+  done
+}
+
+iface_menu_pick() {
+  local title="$1" want="${2:-all}"
+  local items=() iface state ip
+  while IFS= read -r iface; do
+    [[ -n "$iface" ]] || continue
+    state=$(<"/sys/class/net/${iface}/operstate" 2>/dev/null || echo unknown)
+    ip=$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}' | head -1)
+    [[ -z "$ip" ]] && ip="no-ipv4"
+    if is_wireless "$iface"; then
+      items+=("$iface" "wifi ${state} ${ip}")
+    else
+      items+=("$iface" "eth ${state} ${ip}")
+    fi
+  done < <(list_physical_ifaces "$want")
+
+  ((${#items[@]})) || {
+    ui_msg "No interfaces" "No matching network interfaces were found."
+    return 1
+  }
+
+  ui_menu "$title" "Select an interface:" "${items[@]}"
+}
+
+iface_status_text() {
+  local iface="$1" file tmp
+  tmp=$(mktemp)
+  {
+    echo "=== ifconfig ${iface} ==="
+    ifconfig "$iface" 2>/dev/null || true
+    echo
+    if is_wireless "$iface"; then
+      echo "=== Wi-Fi status ==="
+      show_wifi_status "$iface" 2>/dev/null || true
+      echo
+    fi
+    file=$(netplan_file_for "$iface")
+    if [[ -f "$file" ]]; then
+      echo "=== netplan (${file}) ==="
+      cat "$file"
+    else
+      echo "No npconfig netplan file for ${iface}."
+    fi
+  } >"$tmp"
+  ui_textbox "Interface ${iface}" "$tmp"
+  rm -f "$tmp"
+}
+
+menu_static_ip_form() {
+  local title="$1"
+  local addr netmask
+  addr=$(ui_input "$title" "IPv4 address:" "192.168.1.50") || return 1
+  looks_like_ipv4 "$addr" || {
+    ui_msg "Invalid IP" "That does not look like a valid IPv4 address."
+    return 1
+  }
+  netmask=$(ui_input "$title" "Netmask:" "255.255.255.0") || return 1
+  looks_like_ipv4 "$netmask" || {
+    ui_msg "Invalid netmask" "That does not look like a valid netmask."
+    return 1
+  }
+  printf '%s %s\n' "$addr" "$netmask"
+}
+
+menu_configure_ethernet() {
+  local iface choice addr netmask prefix
+  iface=$(iface_menu_pick "Ethernet interface" ethernet) || return 0
+
+  while true; do
+    choice=$(ui_menu "Ethernet: ${iface}" "Choose an action:" \
+      dhcp "Use DHCP" \
+      static "Static IPv4" \
+      up "Bring interface up" \
+      down "Bring interface down" \
+      status "Show status" \
+      back "Back") || return 0
+
+    case "$choice" in
+      dhcp)
+        write_netplan_dhcp "$iface"
+        apply_netplan
+        ifconfig "$iface" up || true
+        ui_msg "Applied" "DHCP enabled for ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
+        ;;
+      static)
+        read -r addr netmask < <(menu_static_ip_form "Static IP: ${iface}") || continue
+        prefix=$(mask_to_prefix "$netmask")
+        write_netplan_static "$iface" "$addr" "$prefix"
+        apply_netplan
+        ifconfig "$iface" up || true
+        ui_msg "Applied" "Static IP set on ${iface}:\n${addr}/${prefix}"
+        ;;
+      up)
+        ifconfig "$iface" up
+        ui_msg "Interface up" "${iface} is up."
+        ;;
+      down)
+        ifconfig "$iface" down
+        ui_msg "Interface down" "${iface} is down."
+        ;;
+      status)
+        iface_status_text "$iface"
+        ;;
+      back)
+        return 0
+        ;;
+    esac
+  done
+}
+
+menu_wifi_pick_network() {
+  local iface="$1"
+  local scan_file items=() ssid security signal line tag
+  scan_file=$(mktemp)
+
+  if command -v nmcli >/dev/null 2>&1; then
+    nmcli -t -f IN-USE,SSID,SECURITY,SIGNAL dev wifi list ifname "$iface" 2>/dev/null >"$scan_file" || true
+    while IFS=: read -r inuse ssid security signal; do
+      [[ -n "$ssid" ]] || continue
+      tag="${ssid}__${signal}"
+      items+=("$tag" "${signal}% ${security:-open} ${inuse:+[connected]}")
+    done <"$scan_file"
+  else
+    ui_msg "Scan unavailable" "nmcli is required for the Wi-Fi scan menu."
+    rm -f "$scan_file"
+    return 1
+  fi
+
+  rm -f "$scan_file"
+  ((${#items[@]})) || {
+    ui_msg "No networks" "No Wi-Fi networks were found. Try again or enter SSID manually."
+    return 1
+  }
+
+  items+=("manual" "Enter SSID manually")
+  tag=$(ui_menu "Wi-Fi scan: ${iface}" "Select a network:" "${items[@]}") || return 1
+  if [[ "$tag" == "manual" ]]; then
+    ui_input "Wi-Fi SSID" "Enter network name (SSID):" ""
+  else
+    printf '%s' "${tag%%__*}"
+  fi
+}
+
+menu_configure_wifi() {
+  local iface choice ssid password security hidden addr netmask prefix
+  iface=$(iface_menu_pick "Wi-Fi interface" wireless) || return 0
+
+  while true; do
+    choice=$(ui_menu "Wi-Fi: ${iface}" "Choose an action:" \
+      scan "Scan and connect" \
+      manual "Connect to hidden/custom SSID" \
+      dhcp "Reconnect saved SSID with DHCP" \
+      static "Reconnect saved SSID with static IP" \
+      up "Bring interface up" \
+      down "Bring interface down" \
+      status "Show status" \
+      back "Back") || return 0
+
+    case "$choice" in
+      scan)
+        ssid=$(menu_wifi_pick_network "$iface") || continue
+        [[ -n "$ssid" ]] || continue
+        security=$(nmcli -t -f SSID,SECURITY dev wifi list ifname "$iface" 2>/dev/null | awk -F: -v s="$ssid" '$1==s{print $2; exit}')
+        if [[ -n "$security" && "$security" != "--" ]]; then
+          password=$(ui_password "Wi-Fi password" "Password for ${ssid}:") || continue
+        else
+          password=""
+        fi
+        write_netplan_wifi "$iface" "$ssid" "$password"
+        apply_netplan
+        ifconfig "$iface" up || true
+        ui_msg "Applied" "Connected ${iface} to:\n${ssid}\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
+        ;;
+      manual)
+        hidden=0
+        ui_yesno "Hidden SSID" "Is this a hidden Wi-Fi network?" && hidden=1 || hidden=0
+        ssid=$(ui_input "Wi-Fi SSID" "Network name:" "") || continue
+        [[ -n "$ssid" ]] || continue
+        ui_yesno "Security" "Does ${ssid} require a password?" && {
+          password=$(ui_password "Wi-Fi password" "Password for ${ssid}:") || continue
+        } || password=""
+        write_netplan_wifi "$iface" "$ssid" "$password" "" "" "$hidden"
+        apply_netplan
+        ifconfig "$iface" up || true
+        ui_msg "Applied" "Configured ${iface} for SSID:\n${ssid}"
+        ;;
+      dhcp)
+        file=$(netplan_file_for "$iface")
+        if [[ ! -f "$file" ]]; then
+          ui_msg "No saved SSID" "Configure Wi-Fi first using scan or manual connect."
+          continue
+        fi
+        ssid=$(awk '
+          /^[[:space:]]*access-points:/ {show=1}
+          show && /^[[:space:]]*"/ {
+            gsub(/^[[:space:]]*"/, "", $0)
+            gsub(/":.*/, "", $0)
+            print $0
+            exit
+          }
+        ' "$file")
+        password=$(awk '
+          /password:/ {
+            gsub(/^[[:space:]]*password:[[:space:]]*/, "", $0)
+            gsub(/^"/, "", $0)
+            gsub(/"$/, "", $0)
+            print $0
+            exit
+          }
+        ' "$file")
+        [[ -n "$ssid" ]] || {
+          ui_msg "No saved SSID" "Could not read SSID from ${file}."
+          continue
+        }
+        write_netplan_wifi "$iface" "$ssid" "$password"
+        apply_netplan
+        ifconfig "$iface" up || true
+        ui_msg "Applied" "DHCP reapplied for ${ssid} on ${iface}."
+        ;;
+      static)
+        file=$(netplan_file_for "$iface")
+        [[ -f "$file" ]] || {
+          ui_msg "No saved SSID" "Configure Wi-Fi first."
+          continue
+        }
+        ssid=$(awk '
+          /^[[:space:]]*access-points:/ {show=1}
+          show && /^[[:space:]]*"/ {
+            gsub(/^[[:space:]]*"/, "", $0)
+            gsub(/":.*/, "", $0)
+            print $0
+            exit
+          }
+        ' "$file")
+        password=$(awk '
+          /password:/ {
+            gsub(/^[[:space:]]*password:[[:space:]]*/, "", $0)
+            gsub(/^"/, "", $0)
+            gsub(/"$/, "", $0)
+            print $0
+            exit
+          }
+        ' "$file")
+        read -r addr netmask < <(menu_static_ip_form "Static Wi-Fi: ${iface}") || continue
+        prefix=$(mask_to_prefix "$netmask")
+        write_netplan_wifi "$iface" "$ssid" "$password" "$addr" "$prefix"
+        apply_netplan
+        ifconfig "$iface" up || true
+        ui_msg "Applied" "Static IP set on ${iface} for ${ssid}:\n${addr}/${prefix}"
+        ;;
+      up)
+        ifconfig "$iface" up
+        ui_msg "Interface up" "${iface} is up."
+        ;;
+      down)
+        ifconfig "$iface" down
+        ui_msg "Interface down" "${iface} is down."
+        ;;
+      status)
+        iface_status_text "$iface"
+        ;;
+      back)
+        return 0
+        ;;
+    esac
+  done
+}
+
+menu_show_all_status() {
+  local tmp
+  tmp=$(mktemp)
+  ifconfig -a >"$tmp" 2>&1 || true
+  ui_textbox "All interfaces" "$tmp"
+  rm -f "$tmp"
+}
+
+menu_show_one_status() {
+  local iface
+  iface=$(iface_menu_pick "Show interface" all) || return 0
+  iface_status_text "$iface"
+}
+
+menu_apply_netplan() {
+  if ui_yesno "Apply netplan" "Regenerate and apply all netplan configuration now?"; then
+    apply_netplan
+    ui_msg "Done" "netplan apply completed."
+  fi
+}
+
+menu_main() {
+  [[ -t 0 ]] || {
+    echo "npconfig menu requires an interactive terminal." >&2
+    exit 1
+  }
+
+  ui_init
+
+  while true; do
+    choice=$(ui_menu "npconfig" "Network setup menu\nWrites ${NETPLAN_DIR}/${FILE_PREFIX}-IFACE.yaml" \
+      ethernet "Configure Ethernet" \
+      wifi "Configure Wi-Fi" \
+      status "Show one interface" \
+      all "Show all interfaces" \
+      apply "Apply netplan now" \
+      quit "Exit") || exit 0
+
+    case "$choice" in
+      ethernet) menu_configure_ethernet ;;
+      wifi) menu_configure_wifi ;;
+      status) menu_show_one_status ;;
+      all) menu_show_all_status ;;
+      apply) menu_apply_netplan ;;
+      quit) exit 0 ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<USAGE
+ifconfig-compatible usage:
+  npconfig
+  npconfig -a
+  npconfig IFACE
+  npconfig IFACE up
+  npconfig IFACE down
+  npconfig IFACE inet dhcp
+  npconfig IFACE A.B.C.D netmask M.M.M.M [broadcast B.B.B.B] [up]
+
+Wi-Fi extensions:
+  npconfig IFACE wifi
+  npconfig IFACE wifi scan
+  npconfig IFACE wifi SSID open inet dhcp [up]
+  npconfig IFACE wifi SSID passphrase PASSWORD inet dhcp [up]
+  npconfig IFACE wifi SSID psk PASSWORD A.B.C.D netmask M.M.M.M [up]
+  npconfig IFACE wifi --hidden SSID passphrase PASSWORD inet dhcp [up]
+
+Interactive menu:
+  npconfig menu
+  npconfig --menu
+  npconfig -m
+
+Notes:
+- Settings persist in /etc/netplan/${FILE_PREFIX}-IFACE.yaml
+- Wi-Fi uses netplan wifis + NetworkManager renderer
+- Menu uses dialog or whiptail (install one if missing)
+USAGE
+}
+
+parse_wifi_args() {
+  local iface="$1"
+  shift
+
+  if [[ $# -eq 0 ]]; then
+    show_wifi_status "$iface"
+    exit 0
+  fi
+
+  if [[ "$1" == "scan" ]]; then
+    wifi_scan "$iface"
+    exit 0
+  fi
+
+  local hidden=0 ssid="" password="" dhcp=1 addr="" netmask="" bring_up=0
+
+  if [[ "$1" == "--hidden" ]]; then
+    hidden=1
+    shift
+  fi
+
+  [[ $# -gt 0 ]] || { echo "npconfig: Wi-Fi SSID missing" >&2; exit 2; }
+  ssid="$1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      open)
+        password=""
+        ;;
+      passphrase|psk|password)
+        shift
+        [[ $# -gt 0 ]] || { echo "npconfig: Wi-Fi password missing" >&2; exit 2; }
+        password="$1"
+        ;;
+      inet)
+        shift
+        [[ $# -gt 0 && "$1" == "dhcp" ]] || { echo "npconfig: expected 'inet dhcp'" >&2; exit 2; }
+        dhcp=1
+        ;;
+      dhcp)
+        dhcp=1
+        ;;
+      netmask)
+        shift
+        [[ $# -gt 0 ]] || { echo "npconfig: netmask value missing" >&2; exit 2; }
+        netmask="$1"
+        dhcp=0
+        ;;
+      broadcast)
+        shift
+        [[ $# -gt 0 ]] || { echo "npconfig: broadcast value missing" >&2; exit 2; }
+        ;;
+      up)
+        bring_up=1
+        ;;
+      down)
+        ifconfig "$iface" down
+        exit 0
+        ;;
+      *)
+        if looks_like_ipv4 "$1"; then
+          addr="$1"
+          dhcp=0
+        else
+          echo "npconfig: unsupported Wi-Fi token '$1'" >&2
+          usage
+          exit 2
+        fi
+        ;;
+    esac
+    shift || true
+  done
+
+  if ! is_wireless "$iface"; then
+    echo "npconfig: '$iface' is not a wireless interface" >&2
+    exit 1
+  fi
+
+  if [[ $dhcp -eq 1 && -z "$addr" ]]; then
+    write_netplan_wifi "$iface" "$ssid" "$password" "" "" "$hidden"
+  else
+    [[ -n "$addr" && -n "$netmask" ]] || {
+      echo "npconfig: static Wi-Fi requires IP and netmask" >&2
+      exit 2
+    }
+    local prefix
+    prefix=$(mask_to_prefix "$netmask")
+    write_netplan_wifi "$iface" "$ssid" "$password" "$addr" "$prefix" "$hidden"
+  fi
+
+  apply_netplan
+  if [[ $bring_up -eq 1 ]]; then
+    ifconfig "$iface" up || true
+  fi
+}
+
+if [[ $# -eq 0 ]]; then
+  show_all
+  exit 0
+fi
+
+if [[ "$1" == "-a" ]]; then
+  show_all
+  exit 0
+fi
+
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "$1" == "menu" || "$1" == "--menu" || "$1" == "-m" ]]; then
+  menu_main
+  exit 0
+fi
+
+iface="$1"
+shift || true
+
+if ! iface_exists "$iface"; then
+  echo "npconfig: interface '$iface' does not exist" >&2
+  exit 1
+fi
+
+if [[ $# -eq 0 ]]; then
+  show_iface "$iface"
+  exit 0
+fi
+
+if [[ "$1" == "wifi" ]]; then
+  shift
+  parse_wifi_args "$iface" "$@"
+  exit 0
+fi
+
+if [[ "$1" == "up" || "$1" == "down" ]]; then
+  ifconfig "$iface" "$1"
+  exit 0
+fi
+
+if [[ $# -ge 2 && "$1" == "inet" && "$2" == "dhcp" ]]; then
+  write_netplan_dhcp "$iface"
+  apply_netplan
+  exit 0
+fi
+
+addr="$1"
+shift
+
+if ! looks_like_ipv4 "$addr"; then
+  echo "npconfig: unsupported command starting with '$addr'" >&2
+  usage
+  exit 2
+fi
+
+netmask=""
+bring_up=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    netmask)
+      shift
+      [[ $# -gt 0 ]] || { echo "npconfig: netmask value missing" >&2; exit 2; }
+      netmask="$1"
+      ;;
+    broadcast)
+      shift
+      [[ $# -gt 0 ]] || { echo "npconfig: broadcast value missing" >&2; exit 2; }
+      ;;
+    up)
+      bring_up=1
+      ;;
+    down)
+      ifconfig "$iface" down
+      exit 0
+      ;;
+    *)
+      echo "npconfig: unsupported token '$1'" >&2
+      usage
+      exit 2
+      ;;
+  esac
+  shift || true
+done
+
+[[ -n "$netmask" ]] || { echo "npconfig: netmask is required for static IPv4" >&2; exit 2; }
+prefix=$(mask_to_prefix "$netmask")
+write_netplan_static "$iface" "$addr" "$prefix"
+apply_netplan
+
+if [[ $bring_up -eq 1 ]]; then
+  ifconfig "$iface" up
+fi
+
+exit 0
