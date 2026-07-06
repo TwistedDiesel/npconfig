@@ -193,13 +193,33 @@ YAML
   fi
 }
 
+ip_link_set() {
+  local iface="$1" state="$2"
+  ip link set dev "$iface" "$state"
+}
+
+format_iface_show() {
+  local iface="$1"
+  echo "${iface}: mtu $(cat "/sys/class/net/${iface}/mtu" 2>/dev/null || echo ?)  state $(cat "/sys/class/net/${iface}/operstate" 2>/dev/null || echo unknown)"
+  ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print "        inet " $4}' || true
+  ip -6 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print "        inet6 " $4}' || true
+  local mac
+  mac=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || true)
+  [[ -n "$mac" ]] && echo "        link/ether ${mac}"
+}
+
 show_all() {
-  ifconfig -a
+  local iface
+  for iface in /sys/class/net/*; do
+    iface=$(basename "$iface")
+    format_iface_show "$iface"
+    echo
+  done
 }
 
 show_iface() {
   local iface="$1"
-  ifconfig "$iface"
+  format_iface_show "$iface"
   if is_wireless "$iface"; then
     echo
     show_wifi_status "$iface"
@@ -237,26 +257,68 @@ show_wifi_status() {
   fi
 }
 
-wifi_scan() {
+wifi_prepare_iface() {
   local iface="$1"
+  ip link set dev "$iface" up 2>/dev/null || true
   if command -v nmcli >/dev/null 2>&1; then
-    nmcli dev wifi list ifname "$iface"
-    return 0
+    nmcli radio wifi on >/dev/null 2>&1 || true
+    nmcli dev set "$iface" managed yes >/dev/null 2>&1 || true
+    timeout 20 nmcli dev wifi rescan ifname "$iface" >/dev/null 2>&1 || true
   fi
+}
+
+wifi_scan_to_file() {
+  local iface="$1" outfile="$2"
+  wifi_prepare_iface "$iface"
+
+  if command -v nmcli >/dev/null 2>&1; then
+    timeout 20 nmcli -t -f IN-USE,SSID,SECURITY,SIGNAL dev wifi list ifname "$iface" >"$outfile" 2>/dev/null
+    return $?
+  fi
+
   if command -v iw >/dev/null 2>&1; then
-    iw dev "$iface" scan | awk '
-      /^BSS / {bssid=$2}
-      /SSID:/ {print bssid, substr($0, index($0,":")+2)}
-    '
+    timeout 25 iw dev "$iface" scan 2>/dev/null | awk '
+      /^BSS / {bssid=$2; sig=""}
+      /signal:/ {sig=$2}
+      /SSID:/ {
+        ssid=substr($0, index($0,":")+2)
+        if (ssid != "") printf ":%s:open:%s\n", ssid, sig
+      }
+    ' >"$outfile"
+    return $?
+  fi
+
+  return 1
+}
+
+wifi_scan() {
+  local iface="$1" tmp
+  tmp=$(mktemp)
+  if wifi_scan_to_file "$iface" "$tmp"; then
+    if command -v nmcli >/dev/null 2>&1; then
+      printf "IN-USE  SSID  SECURITY  SIGNAL\n"
+      while IFS=: read -r inuse ssid security signal; do
+        [[ -n "$ssid" ]] || continue
+        printf '%s  %s  %s  %s\n' "$inuse" "$ssid" "${security:-open}" "$signal"
+      done <"$tmp"
+    else
+      printf "SSID  SIGNAL\n"
+      while IFS=: read -r _ ssid _ signal; do
+        [[ -n "$ssid" ]] || continue
+        printf '%s  %s\n' "$ssid" "$signal"
+      done <"$tmp"
+    fi
+    rm -f "$tmp"
     return 0
   fi
-  echo "npconfig: install nmcli or iw to scan Wi-Fi" >&2
+  rm -f "$tmp"
+  echo "npconfig: install nmcli or iw to scan Wi-Fi (NetworkManager recommended)" >&2
   exit 1
 }
 
 apply_netplan() {
   netplan generate
-  netplan apply
+  timeout 90 netplan apply
 }
 
 ui_init() {
@@ -347,8 +409,8 @@ iface_status_text() {
   local iface="$1" file tmp
   tmp=$(mktemp)
   {
-    echo "=== ifconfig ${iface} ==="
-    ifconfig "$iface" 2>/dev/null || true
+    echo "=== ${iface} ==="
+    format_iface_show "$iface" 2>/dev/null || true
     echo
     if is_wireless "$iface"; then
       echo "=== Wi-Fi status ==="
@@ -399,24 +461,24 @@ menu_configure_ethernet() {
     case "$choice" in
       dhcp)
         write_netplan_dhcp "$iface"
-        apply_netplan
-        ifconfig "$iface" up || true
+        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        ip_link_set "$iface" up || true
         ui_msg "Applied" "DHCP enabled for ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
         ;;
       static)
         read -r addr netmask < <(menu_static_ip_form "Static IP: ${iface}") || continue
         prefix=$(mask_to_prefix "$netmask")
         write_netplan_static "$iface" "$addr" "$prefix"
-        apply_netplan
-        ifconfig "$iface" up || true
+        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        ip_link_set "$iface" up || true
         ui_msg "Applied" "Static IP set on ${iface}:\n${addr}/${prefix}"
         ;;
       up)
-        ifconfig "$iface" up
+        ip_link_set "$iface" up
         ui_msg "Interface up" "${iface} is up."
         ;;
       down)
-        ifconfig "$iface" down
+        ip_link_set "$iface" down
         ui_msg "Interface down" "${iface} is down."
         ;;
       status)
@@ -431,40 +493,54 @@ menu_configure_ethernet() {
 
 menu_wifi_pick_network() {
   local iface="$1"
-  local scan_file items=() ssid security signal line tag
+  local scan_file map_file items=() ssid security signal inuse tag idx=0
   scan_file=$(mktemp)
+  map_file="${scan_file}.map"
 
-  if command -v nmcli >/dev/null 2>&1; then
-    nmcli -t -f IN-USE,SSID,SECURITY,SIGNAL dev wifi list ifname "$iface" 2>/dev/null >"$scan_file" || true
-    while IFS=: read -r inuse ssid security signal; do
-      [[ -n "$ssid" ]] || continue
-      tag="${ssid}__${signal}"
-      items+=("$tag" "${signal}% ${security:-open} ${inuse:+[connected]}")
-    done <"$scan_file"
-  else
-    ui_msg "Scan unavailable" "nmcli is required for the Wi-Fi scan menu."
-    rm -f "$scan_file"
+  ui_msg "Wi-Fi scan" "Scanning on ${iface}.\nThis may take up to 20 seconds."
+  if ! wifi_scan_to_file "$iface" "$scan_file"; then
+    rm -f "$scan_file" "$map_file"
+    ui_msg "Scan failed" "Could not scan Wi-Fi on ${iface}.\n\nEnsure NetworkManager is running:\n  systemctl start NetworkManager\n\nOr install iw for basic scan support."
     return 1
   fi
 
+  while IFS=: read -r inuse ssid security signal; do
+    [[ -n "$ssid" ]] || continue
+    idx=$((idx + 1))
+    tag="net${idx}"
+    items+=("$tag" "${ssid}  ${signal}%  ${security:-open}  ${inuse:+[connected]}")
+    printf '%s\t%s\n' "$tag" "$ssid" >>"$map_file"
+  done <"$scan_file"
+
   rm -f "$scan_file"
   ((${#items[@]})) || {
-    ui_msg "No networks" "No Wi-Fi networks were found. Try again or enter SSID manually."
+    rm -f "$map_file"
+    ui_msg "No networks" "No Wi-Fi networks were found.\n\nTry manual SSID entry or check that the adapter is up."
     return 1
   }
 
   items+=("manual" "Enter SSID manually")
-  tag=$(ui_menu "Wi-Fi scan: ${iface}" "Select a network:" "${items[@]}") || return 1
+  tag=$(ui_menu "Wi-Fi scan: ${iface}" "Select a network:" "${items[@]}") || {
+    rm -f "$map_file"
+    return 1
+  }
   if [[ "$tag" == "manual" ]]; then
+    rm -f "$map_file"
     ui_input "Wi-Fi SSID" "Enter network name (SSID):" ""
-  else
-    printf '%s' "${tag%%__*}"
+    return 0
   fi
+  awk -F '\t' -v t="$tag" '$1==t {print $2; exit}' "$map_file"
+  rm -f "$map_file"
 }
 
 menu_configure_wifi() {
-  local iface choice ssid password security hidden addr netmask prefix
+  local iface choice ssid password security hidden addr netmask prefix file
   iface=$(iface_menu_pick "Wi-Fi interface" wireless) || return 0
+
+  if ! command -v nmcli >/dev/null 2>&1 && ! command -v iw >/dev/null 2>&1; then
+    ui_msg "Wi-Fi tools missing" "Install NetworkManager (nmcli) or iw before configuring Wi-Fi."
+    return 0
+  fi
 
   while true; do
     choice=$(ui_menu "Wi-Fi: ${iface}" "Choose an action:" \
@@ -481,15 +557,15 @@ menu_configure_wifi() {
       scan)
         ssid=$(menu_wifi_pick_network "$iface") || continue
         [[ -n "$ssid" ]] || continue
-        security=$(nmcli -t -f SSID,SECURITY dev wifi list ifname "$iface" 2>/dev/null | awk -F: -v s="$ssid" '$1==s{print $2; exit}')
+        security=$(timeout 10 nmcli -t -f SSID,SECURITY dev wifi list ifname "$iface" 2>/dev/null | awk -F: -v s="$ssid" '$1==s{print $2; exit}')
         if [[ -n "$security" && "$security" != "--" ]]; then
           password=$(ui_password "Wi-Fi password" "Password for ${ssid}:") || continue
         else
           password=""
         fi
         write_netplan_wifi "$iface" "$ssid" "$password"
-        apply_netplan
-        ifconfig "$iface" up || true
+        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        ip_link_set "$iface" up || true
         ui_msg "Applied" "Connected ${iface} to:\n${ssid}\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
         ;;
       manual)
@@ -501,8 +577,8 @@ menu_configure_wifi() {
           password=$(ui_password "Wi-Fi password" "Password for ${ssid}:") || continue
         } || password=""
         write_netplan_wifi "$iface" "$ssid" "$password" "" "" "$hidden"
-        apply_netplan
-        ifconfig "$iface" up || true
+        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        ip_link_set "$iface" up || true
         ui_msg "Applied" "Configured ${iface} for SSID:\n${ssid}"
         ;;
       dhcp)
@@ -534,8 +610,8 @@ menu_configure_wifi() {
           continue
         }
         write_netplan_wifi "$iface" "$ssid" "$password"
-        apply_netplan
-        ifconfig "$iface" up || true
+        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        ip_link_set "$iface" up || true
         ui_msg "Applied" "DHCP reapplied for ${ssid} on ${iface}."
         ;;
       static)
@@ -565,16 +641,16 @@ menu_configure_wifi() {
         read -r addr netmask < <(menu_static_ip_form "Static Wi-Fi: ${iface}") || continue
         prefix=$(mask_to_prefix "$netmask")
         write_netplan_wifi "$iface" "$ssid" "$password" "$addr" "$prefix"
-        apply_netplan
-        ifconfig "$iface" up || true
+        apply_netplan || ui_msg "Apply warning" "netplan apply failed or timed out."
+        ip_link_set "$iface" up || true
         ui_msg "Applied" "Static IP set on ${iface} for ${ssid}:\n${addr}/${prefix}"
         ;;
       up)
-        ifconfig "$iface" up
+        ip_link_set "$iface" up
         ui_msg "Interface up" "${iface} is up."
         ;;
       down)
-        ifconfig "$iface" down
+        ip_link_set "$iface" down
         ui_msg "Interface down" "${iface} is down."
         ;;
       status)
@@ -590,7 +666,13 @@ menu_configure_wifi() {
 menu_show_all_status() {
   local tmp
   tmp=$(mktemp)
-  ifconfig -a >"$tmp" 2>&1 || true
+  {
+    echo "=== links ==="
+    ip -br link show
+    echo
+    echo "=== addresses ==="
+    ip -br addr show
+  } >"$tmp" 2>&1 || true
   ui_textbox "All interfaces" "$tmp"
   rm -f "$tmp"
 }
@@ -615,6 +697,7 @@ menu_main() {
   }
 
   ui_init
+  set +e
 
   while true; do
     choice=$(ui_menu "npconfig" "Network setup menu\nWrites ${NETPLAN_DIR}/${FILE_PREFIX}-IFACE.yaml" \
@@ -664,6 +747,7 @@ Notes:
 - Settings persist in /etc/netplan/${FILE_PREFIX}-IFACE.yaml
 - Wi-Fi uses netplan wifis + NetworkManager renderer
 - Menu uses dialog or whiptail (install one if missing)
+- Uses iproute2 (ip) only; netplan + nmcli/iw for Wi-Fi scan
 USAGE
 }
 
@@ -724,7 +808,7 @@ parse_wifi_args() {
         bring_up=1
         ;;
       down)
-        ifconfig "$iface" down
+        ip_link_set "$iface" down
         exit 0
         ;;
       *)
@@ -760,7 +844,7 @@ parse_wifi_args() {
 
   apply_netplan
   if [[ $bring_up -eq 1 ]]; then
-    ifconfig "$iface" up || true
+    ip_link_set "$iface" up || true
   fi
 }
 
@@ -804,7 +888,7 @@ if [[ "$1" == "wifi" ]]; then
 fi
 
 if [[ "$1" == "up" || "$1" == "down" ]]; then
-  ifconfig "$iface" "$1"
+  ip_link_set "$iface" "$1"
   exit 0
 fi
 
@@ -841,7 +925,7 @@ while [[ $# -gt 0 ]]; do
       bring_up=1
       ;;
     down)
-      ifconfig "$iface" down
+      ip_link_set "$iface" down
       exit 0
       ;;
     *)
@@ -859,7 +943,7 @@ write_netplan_static "$iface" "$addr" "$prefix"
 apply_netplan
 
 if [[ $bring_up -eq 1 ]]; then
-  ifconfig "$iface" up
+  ip_link_set "$iface" up
 fi
 
 exit 0

@@ -14,14 +14,16 @@ No sysadmin should have to bring a netplan manual just to bring networking up.
 
 ## Requirements
 
-- Linux with **netplan**
+- Linux with **netplan** and **iproute2** (`ip`)
 - **root** / `sudo`
-- For Wi-Fi scan/menu: **NetworkManager** (`nmcli`) recommended
+- For Wi-Fi scan/menu: **NetworkManager** (`nmcli`) recommended, or **iw** as fallback
 - For interactive menu: **whiptail** or **dialog**
 
 ```bash
-sudo apt-get install -y netplan.io network-manager whiptail
+sudo apt-get install -y netplan.io iproute2 network-manager whiptail
 ```
+
+`ifconfig` is **not** required.
 
 ## Install
 
