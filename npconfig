@@ -46,10 +46,130 @@ uses_network_manager() {
   [[ "$(detect_netplan_renderer)" == "NetworkManager" ]]
 }
 
-netplan_renderer_yaml() {
-  local renderer
+static_defaults_for_iface() {
+  local iface="$1" gw dns1 dns2
+  gw=$(ip -4 route show dev "$iface" default 2>/dev/null | awk '{print $3}' | head -1)
+  [[ -z "$gw" ]] && gw=$(ip -4 route show default 2>/dev/null | awk '{print $3}' | head -1)
+  [[ -z "$gw" ]] && gw="192.168.1.1"
+  dns1=$(awk '/^nameserver / {print $2; exit}' /etc/resolv.conf 2>/dev/null || true)
+  dns2=$(awk 'NR==2 && /^nameserver / {print $2; exit}' /etc/resolv.conf 2>/dev/null || true)
+  [[ -z "$dns1" ]] && dns1="1.1.1.1"
+  [[ -z "$dns2" ]] && dns2="8.8.8.8"
+  printf '%s %s %s\n' "$gw" "$dns1" "$dns2"
+}
+
+write_netplan_dhcp() {
+  local iface="$1" renderer ytype file
   renderer=$(detect_netplan_renderer)
-  printf '  renderer: %s\n' "$renderer"
+  ytype=$(yaml_type "$iface")
+  file=$(netplan_file_for "$iface")
+
+  cat >"$file" <<YAML
+network:
+  version: 2
+  renderer: ${renderer}
+  ${ytype}:
+    ${iface}:
+      dhcp4: true
+YAML
+  secure_netplan_file "$file"
+}
+
+write_netplan_static() {
+  local iface="$1" addr="$2" prefix="$3" gateway="${4:-}" dns1="${5:-}" dns2="${6:-}"
+  local renderer ytype file
+  if [[ -z "$gateway" || -z "$dns1" ]]; then
+    read -r gateway dns1 dns2 < <(static_defaults_for_iface "$iface")
+  fi
+  [[ -z "$dns2" ]] && dns2="8.8.8.8"
+  renderer=$(detect_netplan_renderer)
+  ytype=$(yaml_type "$iface")
+  file=$(netplan_file_for "$iface")
+
+  cat >"$file" <<YAML
+network:
+  version: 2
+  renderer: ${renderer}
+  ${ytype}:
+    ${iface}:
+      dhcp4: false
+      addresses:
+        - ${addr}/${prefix}
+      routes:
+        - to: default
+          via: ${gateway}
+      nameservers:
+        addresses:
+          - ${dns1}
+          - ${dns2}
+YAML
+  secure_netplan_file "$file"
+}
+
+write_netplan_wifi() {
+  local iface="$1" ssid="$2" password="${3:-}" addr="${4:-}" prefix="${5:-}" hidden="${6:-0}"
+  local gateway="${7:-}" dns1="${8:-}" dns2="${9:-}"
+  local file renderer quoted_ssid ap_block
+  renderer=$(detect_netplan_renderer)
+  file=$(netplan_file_for "$iface")
+  quoted_ssid=$(yaml_quote "$ssid")
+
+  if [[ -n "$password" ]]; then
+    ap_block=$(cat <<YAML
+      access-points:
+        ${quoted_ssid}:
+          password: $(yaml_quote "$password")
+YAML
+)
+  else
+    ap_block=$(cat <<YAML
+      access-points:
+        ${quoted_ssid}: {}
+YAML
+)
+  fi
+
+  if [[ "$hidden" == "1" ]]; then
+    ap_block="${ap_block}
+          hidden: true"
+  fi
+
+  if [[ -n "$addr" && -n "$prefix" ]]; then
+    if [[ -z "$gateway" || -z "$dns1" ]]; then
+      read -r gateway dns1 dns2 < <(static_defaults_for_iface "$iface")
+    fi
+    [[ -z "$dns2" ]] && dns2="8.8.8.8"
+    cat >"$file" <<YAML
+network:
+  version: 2
+  renderer: ${renderer}
+  wifis:
+    ${iface}:
+      dhcp4: false
+${ap_block}
+      addresses:
+        - ${addr}/${prefix}
+      routes:
+        - to: default
+          via: ${gateway}
+      nameservers:
+        addresses:
+          - ${dns1}
+          - ${dns2}
+YAML
+    secure_netplan_file "$file"
+  else
+    cat >"$file" <<YAML
+network:
+  version: 2
+  renderer: ${renderer}
+  wifis:
+    ${iface}:
+      dhcp4: true
+${ap_block}
+YAML
+    secure_netplan_file "$file"
+  fi
 }
 
 is_wireless() {
@@ -145,97 +265,6 @@ secure_netplan_file() {
   local file="$1"
   chown root:root "$file"
   chmod 600 "$file"
-}
-
-write_netplan_dhcp() {
-  local iface="$1"
-  local ytype
-  ytype=$(yaml_type "$iface")
-  local file
-  file=$(netplan_file_for "$iface")
-
-  cat >"$file" <<YAML
-network:
-  version: 2
-$(netplan_renderer_yaml)  ${ytype}:
-    ${iface}:
-      dhcp4: true
-YAML
-  secure_netplan_file "$file"
-}
-
-write_netplan_static() {
-  local iface="$1" addr="$2" prefix="$3"
-  local ytype
-  ytype=$(yaml_type "$iface")
-  local file
-  file=$(netplan_file_for "$iface")
-
-  cat >"$file" <<YAML
-network:
-  version: 2
-$(netplan_renderer_yaml)  ${ytype}:
-    ${iface}:
-      dhcp4: false
-      addresses:
-        - ${addr}/${prefix}
-      routes: []
-      nameservers: {}
-YAML
-  secure_netplan_file "$file"
-}
-
-write_netplan_wifi() {
-  local iface="$1" ssid="$2" password="${3:-}" addr="${4:-}" prefix="${5:-}" hidden="${6:-0}"
-  local file quoted_ssid ap_block
-  file=$(netplan_file_for "$iface")
-  quoted_ssid=$(yaml_quote "$ssid")
-
-  if [[ -n "$password" ]]; then
-    ap_block=$(cat <<YAML
-      access-points:
-        ${quoted_ssid}:
-          password: $(yaml_quote "$password")
-YAML
-)
-  else
-    ap_block=$(cat <<YAML
-      access-points:
-        ${quoted_ssid}: {}
-YAML
-)
-  fi
-
-  if [[ "$hidden" == "1" ]]; then
-    ap_block="${ap_block}
-          hidden: true"
-  fi
-
-  if [[ -n "$addr" && -n "$prefix" ]]; then
-    cat >"$file" <<YAML
-network:
-  version: 2
-$(netplan_renderer_yaml)  wifis:
-    ${iface}:
-      dhcp4: false
-${ap_block}
-      addresses:
-        - ${addr}/${prefix}
-      routes: []
-      nameservers: {}
-YAML
-    secure_netplan_file "$file"
-  else
-    cat >"$file" <<YAML
-network:
-  version: 2
-$(netplan_renderer_yaml)  wifis:
-    ${iface}:
-      dhcp4: true
-${ap_block}
-YAML
-    secure_netplan_file "$file"
-  fi
 }
 
 ip_link_set() {
@@ -808,15 +837,19 @@ iface_status_text() {
 
 menu_static_ip_form() {
   local title="$1" iface="${2:-}"
-  local addr netmask defaults
+  local addr netmask gateway dns1 dns2 defaults
   if [[ -n "$iface" ]]; then
     defaults=$(default_ipv4_for_iface "$iface" 2>/dev/null || true)
     if [[ -n "$defaults" ]]; then
       read -r addr netmask <<<"$defaults"
     fi
+    read -r gateway dns1 dns2 < <(static_defaults_for_iface "$iface")
   fi
   [[ -z "${addr:-}" ]] && addr="192.168.1.50"
   [[ -z "${netmask:-}" ]] && netmask="255.255.255.0"
+  [[ -z "${gateway:-}" ]] && gateway="192.168.1.1"
+  [[ -z "${dns1:-}" ]] && dns1="1.1.1.1"
+  [[ -z "${dns2:-}" ]] && dns2="8.8.8.8"
   addr=$(ui_input "$title" "IPv4 address:" "$addr") || return 1
   looks_like_ipv4 "$addr" || {
     ui_msg "Invalid IP" "That does not look like a valid IPv4 address."
@@ -827,7 +860,22 @@ menu_static_ip_form() {
     ui_msg "Invalid netmask" "That does not look like a valid netmask."
     return 1
   }
-  printf '%s %s\n' "$addr" "$netmask"
+  gateway=$(ui_input "$title" "Gateway:" "$gateway") || return 1
+  looks_like_ipv4 "$gateway" || {
+    ui_msg "Invalid gateway" "That does not look like a valid gateway address."
+    return 1
+  }
+  dns1=$(ui_input "$title" "Primary DNS:" "$dns1") || return 1
+  looks_like_ipv4 "$dns1" || {
+    ui_msg "Invalid DNS" "That does not look like a valid DNS address."
+    return 1
+  }
+  dns2=$(ui_input "$title" "Secondary DNS:" "$dns2") || return 1
+  looks_like_ipv4 "$dns2" || {
+    ui_msg "Invalid DNS" "That does not look like a valid DNS address."
+    return 1
+  }
+  printf '%s %s %s %s %s\n' "$addr" "$netmask" "$gateway" "$dns1" "$dns2"
 }
 
 menu_configure_ethernet() {
@@ -855,9 +903,9 @@ menu_configure_ethernet() {
         ui_msg "Applied" "DHCP enabled for ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
         ;;
       static)
-        read -r addr netmask < <(menu_static_ip_form "Static IP: ${iface}" "$iface") || continue
+        read -r addr netmask gateway dns1 dns2 < <(menu_static_ip_form "Static IP: ${iface}" "$iface") || continue
         prefix=$(mask_to_prefix "$netmask")
-        write_netplan_static "$iface" "$addr" "$prefix"
+        write_netplan_static "$iface" "$addr" "$prefix" "$gateway" "$dns1" "$dns2"
         apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
         ui_msg "Applied" "Static IP set on ${iface}:\n${addr}/${prefix}"
@@ -1007,9 +1055,9 @@ menu_configure_wifi() {
           ui_msg "No saved SSID" "No Wi-Fi config found for ${iface} in netplan."
           continue
         fi
-        read -r addr netmask < <(menu_static_ip_form "Static Wi-Fi: ${iface}" "$iface") || continue
+        read -r addr netmask gateway dns1 dns2 < <(menu_static_ip_form "Static Wi-Fi: ${iface}" "$iface") || continue
         prefix=$(mask_to_prefix "$netmask")
-        write_netplan_wifi "$iface" "$ssid" "$password" "$addr" "$prefix"
+        write_netplan_wifi "$iface" "$ssid" "$password" "$addr" "$prefix" 0 "$gateway" "$dns1" "$dns2"
         apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
         ui_msg "Applied" "Static IP set on ${iface} for ${ssid}:\n${addr}/${prefix}"
