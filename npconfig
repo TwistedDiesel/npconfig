@@ -102,6 +102,12 @@ netplan_file_for() {
   echo "${NETPLAN_DIR}/${FILE_PREFIX}-${iface}.yaml"
 }
 
+secure_netplan_file() {
+  local file="$1"
+  chown root:root "$file"
+  chmod 600 "$file"
+}
+
 write_netplan_dhcp() {
   local iface="$1"
   local ytype
@@ -117,6 +123,7 @@ network:
     ${iface}:
       dhcp4: true
 YAML
+  secure_netplan_file "$file"
 }
 
 write_netplan_static() {
@@ -138,6 +145,7 @@ network:
       routes: []
       nameservers: {}
 YAML
+  secure_netplan_file "$file"
 }
 
 write_netplan_wifi() {
@@ -180,6 +188,7 @@ ${ap_block}
       routes: []
       nameservers: {}
 YAML
+    secure_netplan_file "$file"
   else
     cat >"$file" <<YAML
 network:
@@ -190,6 +199,7 @@ network:
       dhcp4: true
 ${ap_block}
 YAML
+    secure_netplan_file "$file"
   fi
 }
 
@@ -317,6 +327,11 @@ wifi_scan() {
 }
 
 apply_netplan() {
+  local f
+  shopt -s nullglob
+  for f in "${NETPLAN_DIR}/${FILE_PREFIX}-"*.yaml; do
+    secure_netplan_file "$f"
+  done
   netplan generate
   timeout 90 netplan apply
 }
