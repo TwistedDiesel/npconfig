@@ -12,11 +12,13 @@ fi
 NETPLAN_DIR=/etc/netplan
 FILE_PREFIX=99-npconfig
 UI_BIN=""
+UI_TTY=/dev/tty
 NETPLAN_RENDERER=""
 NETPLAN_LAST_LOG=""
 NP_LOG_DIR=/var/log/npconfig
 NP_SESSION_LOG=""
 NP_XTRACE_FD=""
+NP_WPA_CTRL_DIR=/run/npconfig-wpa
 
 log_init() {
   mkdir -p "$NP_LOG_DIR"
@@ -228,6 +230,11 @@ write_netplan_wifi() {
   local iface="$1" ssid="$2" password="${3:-}" addr="${4:-}" prefix="${5:-}" hidden="${6:-0}"
   local gateway="${7:-}" dns1="${8:-}" dns2="${9:-}"
   local file renderer quoted_ssid ap_block
+  ssid=$(validate_ssid "$ssid") || {
+    echo "npconfig: invalid or corrupted SSID (refusing to write netplan)" >&2
+    return 1
+  }
+  password=$(sanitize_ui_text "$password")
   renderer=$(detect_netplan_renderer)
   file=$(netplan_file_for "$iface")
   quoted_ssid=$(yaml_quote "$ssid")
@@ -264,7 +271,8 @@ network:
   wifis:
     ${iface}:
       dhcp4: false
-$(networkd_wifi_extra_yaml)${ap_block}
+$(networkd_wifi_extra_yaml)
+${ap_block}
       addresses:
         - ${addr}/${prefix}
       routes:
@@ -285,7 +293,8 @@ network:
   wifis:
     ${iface}:
       dhcp4: true
-$(networkd_wifi_extra_yaml)${ap_block}
+$(networkd_wifi_extra_yaml)
+${ap_block}
 YAML
     secure_netplan_file "$file"
     log_write_file "write_netplan_wifi dhcp ${iface}" "$file"
@@ -308,9 +317,33 @@ yaml_type() {
 
 yaml_quote() {
   local s="$1"
+  s=$(sanitize_ui_text "$s")
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
   printf '"%s"' "$s"
+}
+
+sanitize_ui_text() {
+  local s="$1"
+  s=$(printf '%s' "$s" | sed $'s/\033\\[[0-9;?]*[a-zA-Z~]//g')
+  s=$(printf '%s' "$s" | sed 's/\[[?0-9;]*[a-zA-Z~]//g')
+  s=$(printf '%s' "$s" | tr -cd '\11\12\15\40-\176')
+  printf '%s' "$s"
+}
+
+validate_ssid() {
+  local s="$1" len
+  s=$(sanitize_ui_text "$s")
+  s=${s//$'\n'/}
+  s=${s//$'\r'/}
+  [[ -n "$s" ]] || return 1
+  len=$(printf '%s' "$s" | wc -c)
+  ((len <= 32)) || return 1
+  [[ "$s" != *"Wi-Fi scan"* ]] || return 1
+  [[ "$s" != *"Please wait"* ]] || return 1
+  [[ "$s" != *"100%"* ]] || return 1
+  [[ "$s" != *"Running netplan"* ]] || return 1
+  printf '%s' "$s"
 }
 
 mask_to_prefix() {
@@ -450,6 +483,25 @@ show_wifi_status() {
   fi
 }
 
+wpa_cli_np() {
+  local iface="$1"
+  shift
+  if [[ -S "${NP_WPA_CTRL_DIR}/${iface}" ]]; then
+    wpa_cli -p "${NP_WPA_CTRL_DIR}" -i "$iface" "$@"
+  else
+    wpa_cli -i "$iface" "$@"
+  fi
+}
+
+wifi_stop_scan_daemon() {
+  local iface="$1" pidfile="/run/npconfig-wpa-scan-${iface}.pid"
+  if [[ -f "$pidfile" ]]; then
+    kill "$(<"$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile"
+  fi
+  rm -f "${NP_WPA_CTRL_DIR}/${iface}" 2>/dev/null || true
+}
+
 wifi_prepare_iface() {
   local iface="$1"
   log_section "wifi_prepare_iface ${iface}"
@@ -466,48 +518,57 @@ wifi_prepare_iface() {
 
 wifi_scan_wpa_supplicant() {
   local iface="$1" outfile="$2"
-  local conf pidfile=/run/npconfig-wpa-scan-${iface}.pid started=0
+  local conf pidfile="/run/npconfig-wpa-scan-${iface}.pid" started=0
 
   command -v wpa_supplicant >/dev/null 2>&1 || return 1
   command -v wpa_cli >/dev/null 2>&1 || return 1
 
   log_section "wifi_scan_wpa_supplicant ${iface}"
+  wifi_stop_scan_daemon "$iface"
 
   if [[ -S "/run/wpa_supplicant/${iface}" ]] || [[ -S "/var/run/wpa_supplicant/${iface}" ]]; then
-    log_cmd "wpa_cli scan ${iface}" wpa_cli -i "$iface" scan || return 1
+    log_cmd "wpa_cli scan ${iface}" wpa_cli_np "$iface" scan || return 1
   else
     conf=$(mktemp)
     cat >"$conf" <<EOF
-ctrl_interface=/run/npconfig-wpa
+ctrl_interface=${NP_WPA_CTRL_DIR}
 update_config=0
 ap_scan=1
 EOF
     log_write_file "wpa scan conf" "$conf"
-    mkdir -p /run/npconfig-wpa
-    chmod 755 /run/npconfig-wpa
+    mkdir -p "${NP_WPA_CTRL_DIR}"
+    chmod 755 "${NP_WPA_CTRL_DIR}"
     if ! log_cmd "wpa_supplicant scan daemon ${iface}" wpa_supplicant -B -i "$iface" -c "$conf" -D nl80211,wext -P "$pidfile"; then
       rm -f "$conf"
       return 1
     fi
     started=1
-    sleep 2
-    log_cmd "wpa_cli scan ${iface}" wpa_cli -i "$iface" scan || true
+    trap 'wifi_stop_scan_daemon "$iface"; rm -f "$conf"; trap - RETURN' RETURN
+    sleep 1
+    log_cmd "wpa_cli scan ${iface}" wpa_cli_np "$iface" scan || true
   fi
 
-  sleep 4
-  log_cmd "wpa_cli scan_results ${iface}" wpa_cli -i "$iface" scan_results
-  wpa_cli -i "$iface" scan_results 2>/dev/null | awk '
-    NR > 1 && $5 != "" {
-      ssid=$5
-      sub(/^[[:space:]]+/, "", ssid)
-      if (ssid != "") printf ":%s:open:%s\n", ssid, $3
-    }
-  ' >"$outfile"
+  local tries=0
+  : >"$outfile"
+  while [[ $tries -lt 12 ]]; do
+    wpa_cli_np "$iface" scan_results 2>/dev/null | awk '
+      NR > 1 && $5 != "" {
+        ssid=$5
+        sub(/^[[:space:]]+/, "", ssid)
+        if (ssid != "") printf ":%s:open:%s\n", ssid, $3
+      }
+    ' >"$outfile"
+    [[ -s "$outfile" ]] && break
+    sleep 1
+    tries=$((tries + 1))
+  done
+  log_cmd "wpa_cli scan_results ${iface}" wpa_cli_np "$iface" scan_results
   log_write_file "wifi scan results ${iface}" "$outfile"
 
-  if [[ $started -eq 1 && -f "$pidfile" ]]; then
-    log_cmd "kill wpa_supplicant scan pid" kill "$(cat "$pidfile")"
-    rm -f "$pidfile" "$conf"
+  if [[ $started -eq 1 ]]; then
+    wifi_stop_scan_daemon "$iface"
+    rm -f "$conf"
+    trap - RETURN
   fi
 
   [[ -s "$outfile" ]]
@@ -553,12 +614,123 @@ wifi_scan_to_file() {
 }
 
 wifi_apply_result_text() {
-  local iface="$1" out
-  out=$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)
-  if command -v networkctl >/dev/null 2>&1; then
-    out="${out}"$'\n'"$(networkctl status "$iface" 2>/dev/null | sed -n '1,12p')"
+  format_wifi_connect_summary "$1" ""
+}
+
+iface_ipv4_cidr() {
+  local iface="$1"
+  ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}' | head -1
+}
+
+iface_ipv4_mode_label() {
+  local iface="$1" path dhcp addr
+  path=$(netplan_iface_path "$iface")
+  dhcp=$(netplan get "${path}.dhcp4" 2>/dev/null || true)
+  addr=$(netplan get "${path}.addresses.0" 2>/dev/null | tr -d '"' || true)
+  if [[ "$dhcp" == "true" ]]; then
+    echo "DHCP"
+  elif [[ -n "$addr" ]]; then
+    echo "Static"
+  else
+    echo "Unknown"
   fi
-  printf '%s' "$out"
+}
+
+wifi_signal_dbm() {
+  local iface="$1"
+  if command -v iw >/dev/null 2>&1; then
+    iw dev "$iface" link 2>/dev/null | awk '/signal:/ {print $2; exit}'
+  fi
+}
+
+wifi_association_label() {
+  local iface="$1" ssid saved
+  ssid=$(iwgetid "$iface" -r 2>/dev/null || true)
+  [[ -n "$ssid" ]] && {
+    echo "CONNECTED"
+    return 0
+  }
+  if IFS=$'\t' read -r saved _ < <(read_wifi_credentials "$iface" 2>/dev/null) && [[ -n "$saved" ]]; then
+    echo "CONFIGURED (not associated)"
+    return 0
+  fi
+  echo "NOT CONNECTED"
+}
+
+wait_for_ipv4_dhcp() {
+  local iface="$1" timeout="${2:-45}" waited=0
+  while [[ $waited -lt $timeout ]]; do
+    [[ -n "$(iface_ipv4_cidr "$iface")" ]] && return 0
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+format_wifi_connect_summary() {
+  local iface="$1" ssid="${2:-}" mode cidr gw dns assoc signal lines=()
+  [[ -n "$ssid" ]] || ssid=$(iwgetid "$iface" -r 2>/dev/null || true)
+  [[ -n "$ssid" ]] || IFS=$'\t' read -r ssid _ < <(read_wifi_credentials "$iface" 2>/dev/null || true)
+  mode=$(iface_ipv4_mode_label "$iface")
+  cidr=$(iface_ipv4_cidr "$iface")
+  gw=$(ip -4 route show dev "$iface" default 2>/dev/null | awk '{print $3}' | head -1)
+  [[ -z "$gw" ]] && gw=$(ip -4 route show default 2>/dev/null | awk '{print $3}' | head -1)
+  dns=$(awk '/^nameserver / {print $2}' /etc/resolv.conf 2>/dev/null | head -3 | paste -sd, -)
+  assoc=$(wifi_association_label "$iface")
+  signal=$(wifi_signal_dbm "$iface")
+
+  [[ -n "$ssid" ]] && lines+=("Network : ${ssid}")
+  lines+=("Wi-Fi   : ${assoc}")
+  [[ -n "$signal" ]] && lines+=("Signal  : ${signal} dBm")
+  lines+=("IPv4    : ${mode}")
+  if [[ -n "$cidr" ]]; then
+    lines+=("Address : ${cidr}")
+    [[ -n "$gw" ]] && lines+=("Gateway : ${gw}")
+    [[ -n "$dns" ]] && lines+=("DNS     : ${dns}")
+  elif [[ "$mode" == "DHCP" ]]; then
+    lines+=("Address : (not assigned yet)")
+    lines+=("")
+    lines+=("DHCP is enabled but no address was received.")
+    lines+=("Try Renew DHCP Lease from the menu.")
+  else
+    lines+=("Address : (none)")
+  fi
+  local IFS=$'\n'
+  printf '%s' "${lines[*]}"
+}
+
+format_iface_ipv4_summary() {
+  local iface="$1" mode cidr gw dns lines=()
+  mode=$(iface_ipv4_mode_label "$iface")
+  cidr=$(iface_ipv4_cidr "$iface")
+  gw=$(ip -4 route show dev "$iface" default 2>/dev/null | awk '{print $3}' | head -1)
+  [[ -z "$gw" ]] && gw=$(ip -4 route show default 2>/dev/null | awk '{print $3}' | head -1)
+  dns=$(awk '/^nameserver / {print $2}' /etc/resolv.conf 2>/dev/null | head -3 | paste -sd, -)
+  lines+=("Interface: ${iface}")
+  lines+=("IPv4     : ${mode}")
+  if [[ -n "$cidr" ]]; then
+    lines+=("Address  : ${cidr}")
+    [[ -n "$gw" ]] && lines+=("Gateway  : ${gw}")
+    [[ -n "$dns" ]] && lines+=("DNS      : ${dns}")
+  elif [[ "$mode" == "DHCP" ]]; then
+    lines+=("Address  : (not assigned yet)")
+  else
+    lines+=("Address  : (none)")
+  fi
+  local IFS=$'\n'
+  printf '%s' "${lines[*]}"
+}
+
+menu_wifi_post_connect() {
+  local iface="$1" ssid="$2"
+  ip_link_set "$iface" up || true
+  if [[ "$(iface_ipv4_mode_label "$iface")" == "DHCP" ]]; then
+    ui_gauge_run "DHCP" "Waiting for DHCP on ${iface}…" wait_for_ipv4_dhcp "$iface" 45 || true
+  else
+    sleep 2
+  fi
+  ui_term_restore
+  ui_msg "Wi-Fi connected" "$(format_wifi_connect_summary "$iface" "$ssid")"
 }
 
 wifi_scan() {
@@ -666,7 +838,7 @@ read_wifi_credentials() {
         exit
       }
     ' "$f" 2>/dev/null || true)
-    if [[ -n "$ssid" ]]; then
+    if [[ -n "$ssid" ]] && ssid=$(validate_ssid "$ssid" 2>/dev/null); then
       printf '%s\t%s\n' "$ssid" "$password"
       return 0
     fi
@@ -695,14 +867,14 @@ read_wifi_credentials() {
         exit
       }
     ' "$f" 2>/dev/null || true)
-    if [[ -n "$ssid" ]]; then
+    if [[ -n "$ssid" ]] && ssid=$(validate_ssid "$ssid" 2>/dev/null); then
       printf '%s\t%s\n' "$ssid" "$password"
       return 0
     fi
   done < <(netplan_files_for_iface "$iface")
 
   ssid=$(netplan get "wifis.${iface}.access-points" 2>/dev/null | head -1 | sed -n 's/^[[:space:]]*"\([^"]*\)".*/\1/p')
-  if [[ -n "$ssid" ]]; then
+  if [[ -n "$ssid" ]] && ssid=$(validate_ssid "$ssid" 2>/dev/null); then
     password=$(netplan get "wifis.${iface}.access-points.\"${ssid}\".password" 2>/dev/null | tr -d '"' || true)
     printf '%s\t%s\n' "$ssid" "$password"
     return 0
@@ -822,14 +994,17 @@ show_apply_error_dialog() {
 }
 
 apply_netplan_or_show_error() {
+  if [[ -n "${UI_BIN:-}" ]]; then
+    if ui_gauge_run "Applying" "Running netplan apply…" apply_netplan; then
+      return 0
+    fi
+    show_apply_error_dialog
+    return 1
+  fi
   if apply_netplan; then
     return 0
   fi
-  if [[ -n "$UI_BIN" ]]; then
-    show_apply_error_dialog
-  else
-    print_apply_error
-  fi
+  print_apply_error
   return 1
 }
 
@@ -899,7 +1074,7 @@ renew_dhcp_lease() {
 
 iface_status_summary() {
   local iface="$1" kind="${2:-Interface}"
-  local state carrier ip gw dns ssid file
+  local state carrier ip gw dns ssid mode assoc signal addr_line
 
   state=$(<"/sys/class/net/${iface}/operstate" 2>/dev/null || echo unknown)
   state=${state^^}
@@ -910,7 +1085,7 @@ iface_status_summary() {
     carrier=n/a
   fi
 
-  ip=$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{print $4}' | head -1)
+  ip=$(iface_ipv4_cidr "$iface")
   [[ -z "$ip" ]] && ip=none
 
   gw=$(ip -4 route show dev "$iface" default 2>/dev/null | awk '{print $3}' | head -1)
@@ -920,19 +1095,43 @@ iface_status_summary() {
   dns=$(awk '/^nameserver / {print $2}' /etc/resolv.conf 2>/dev/null | head -3 | paste -sd, -)
   [[ -z "$dns" ]] && dns=none
 
-  printf '%s: %s\n\nStatus : %s\nCarrier: %s\nIP     : %s\nGateway: %s\nDNS    : %s' \
-    "$kind" "$iface" "$state" "$carrier" "$ip" "$gw" "$dns"
+  mode=$(iface_ipv4_mode_label "$iface")
 
   if is_wireless "$iface"; then
+    assoc=$(wifi_association_label "$iface")
     ssid=$(iwgetid "$iface" -r 2>/dev/null || true)
     if [[ -z "$ssid" ]]; then
       IFS=$'\t' read -r ssid _ < <(read_wifi_credentials "$iface" 2>/dev/null || true)
     fi
-    [[ -n "$ssid" ]] && printf '\nSSID   : %s' "$ssid"
+    ssid=$(validate_ssid "$ssid" 2>/dev/null || true)
+    signal=$(wifi_signal_dbm "$iface")
+    if [[ "$ip" == "none" && "$mode" == "DHCP" ]]; then
+      addr_line="(waiting for DHCP)"
+    elif [[ "$ip" == "none" ]]; then
+      addr_line="(none)"
+    else
+      addr_line="$ip"
+    fi
+
+    printf '%s: %s\n\nLink      : %s  carrier %s\nWi-Fi     : %s' \
+      "$kind" "$iface" "$state" "$carrier" "$assoc"
+    [[ -n "$ssid" ]] && printf '\nSSID      : %s' "$ssid"
+    [[ -n "$signal" ]] && printf '\nSignal    : %s dBm' "$signal"
+    printf '\nIPv4 mode : %s\nIPv4 addr : %s\nGateway   : %s\nDNS       : %s' \
+      "$mode" "$addr_line" "$gw" "$dns"
+  else
+    if [[ "$ip" == "none" && "$mode" == "DHCP" ]]; then
+      addr_line="(waiting for DHCP)"
+    elif [[ "$ip" == "none" ]]; then
+      addr_line="(none)"
+    else
+      addr_line="$ip"
+    fi
+    printf '%s: %s\n\nLink      : %s  carrier %s\nIPv4 mode : %s\nIPv4 addr : %s\nGateway   : %s\nDNS       : %s' \
+      "$kind" "$iface" "$state" "$carrier" "$mode" "$addr_line" "$gw" "$dns"
   fi
 
-  printf '\nNetplan: %s' "$(netplan_config_mode_for_iface "$iface")"
-  printf '\nBackend: %s' "$(detect_netplan_renderer)"
+  printf '\nBackend   : %s' "$(detect_netplan_renderer)"
 }
 
 iface_menu_body() {
@@ -954,38 +1153,91 @@ ui_init() {
 }
 
 ui_msg() {
-  local title="$1" text="$2"
-  "$UI_BIN" --title "$title" --msgbox "$text" 12 72
+  local title="$1" text="$2" lines h
+  text=$(sanitize_ui_text "$text")
+  lines=$(printf '%s\n' "$text" | wc -l)
+  h=$((lines + 4))
+  ((h < 10)) && h=10
+  ((h > 24)) && h=24
+  ui_term_restore
+  "$UI_BIN" --title "$title" --msgbox "$text" "$h" 72 <"$UI_TTY" >"$UI_TTY" 2>&1
+}
+
+ui_term_restore() {
+  [[ -n "${UI_BIN:-}" ]] || return 0
+  [[ -e "$UI_TTY" ]] || return 0
+  { tput cnorm 2>/dev/null; printf '\033[0m'; } >"$UI_TTY" 2>&1 || true
+  stty -F "$UI_TTY" sane 2>/dev/null || stty sane <"$UI_TTY" 2>/dev/null || true
 }
 
 ui_yesno() {
   local title="$1" text="$2"
-  "$UI_BIN" --title "$title" --yesno "$text" 10 72
+  text=$(sanitize_ui_text "$text")
+  ui_term_restore
+  "$UI_BIN" --title "$title" --yesno "$text" 10 72 <"$UI_TTY" >"$UI_TTY" 2>&1
 }
 
 ui_input() {
   local title="$1" prompt="$2" default="${3:-}"
   local out
-  out=$("$UI_BIN" --title "$title" --inputbox "$prompt" 10 72 "$default" 3>&1 1>&2 2>&3) || return 1
+  ui_term_restore
+  out=$("$UI_BIN" --title "$title" --inputbox "$prompt" 10 72 "$default" 3>&1 1>&2 2>&3 <"$UI_TTY") || return 1
+  out=$(sanitize_ui_text "$out")
+  ui_term_restore
   printf '%s' "$out"
 }
 
 ui_password() {
   local title="$1" prompt="$2"
   local out
-  out=$("$UI_BIN" --title "$title" --passwordbox "$prompt" 10 72 3>&1 1>&2 2>&3) || return 1
+  ui_term_restore
+  out=$("$UI_BIN" --title "$title" --passwordbox "$prompt" 10 72 3>&1 1>&2 2>&3 <"$UI_TTY") || return 1
+  out=$(sanitize_ui_text "$out")
+  ui_term_restore
   printf '%s' "$out"
 }
 
 ui_menu() {
-  local title="$1" text="$2"
+  local title="$1" text="$2" out
   shift 2
-  "$UI_BIN" --title "$title" --menu "$text" 24 78 10 "$@" 3>&1 1>&2 2>&3
+  ui_term_restore
+  out=$("$UI_BIN" --title "$title" --menu "$text" 24 78 10 "$@" 3>&1 1>&2 2>&3 <"$UI_TTY") || return 1
+  out=$(sanitize_ui_text "$out")
+  ui_term_restore
+  printf '%s' "$out"
 }
 
 ui_textbox() {
   local title="$1" file="$2"
-  "$UI_BIN" --title "$title" --textbox "$file" 22 78
+  ui_term_restore
+  "$UI_BIN" --title "$title" --textbox "$file" 22 78 <"$UI_TTY" >"$UI_TTY" 2>&1
+  ui_term_restore
+}
+
+ui_wait() {
+  local title="$1" text="$2" rc=1 cmd_pid
+  shift 2
+  [[ -n "${UI_BIN:-}" ]] || {
+    "$@"
+    return $?
+  }
+  ui_term_restore
+  set +e
+  "$@" >/dev/null 2>&1 &
+  cmd_pid=$!
+  set -e
+  while kill -0 "$cmd_pid" 2>/dev/null; do
+    "$UI_BIN" --title "$title" --infobox "${text}\n\nPlease wait…" 8 70 <"$UI_TTY" >"$UI_TTY" 2>&1
+    sleep 0.4
+  done
+  wait "$cmd_pid"
+  rc=$?
+  ui_term_restore
+  return "$rc"
+}
+
+ui_gauge_run() {
+  ui_wait "$@"
 }
 
 list_physical_ifaces() {
@@ -1104,7 +1356,9 @@ menu_configure_ethernet() {
         write_netplan_dhcp "$iface"
         apply_netplan_or_show_error || continue
         ip_link_set "$iface" up || true
-        ui_msg "Applied" "DHCP enabled for ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
+        ui_gauge_run "DHCP" "Waiting for DHCP on ${iface}…" wait_for_ipv4_dhcp "$iface" 45 || true
+        ui_term_restore
+        ui_msg "Applied" "$(format_iface_ipv4_summary "$iface")"
         ;;
       static)
         read -r addr netmask gateway dns1 dns2 < <(menu_static_ip_form "Static IP: ${iface}" "$iface") || continue
@@ -1122,7 +1376,11 @@ menu_configure_ethernet() {
         ;;
       renew)
         renew_dhcp_lease "$iface"
-        ui_msg "DHCP renewed" "Requested DHCP renewal on ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
+        if [[ "$(iface_ipv4_mode_label "$iface")" == "DHCP" ]]; then
+          ui_gauge_run "DHCP" "Waiting for DHCP on ${iface}…" wait_for_ipv4_dhcp "$iface" 30 || true
+        fi
+        ui_term_restore
+        ui_msg "DHCP renewed" "$(format_iface_ipv4_summary "$iface")"
         ;;
       netplan)
         iface_status_text "$iface"
@@ -1146,8 +1404,13 @@ menu_wifi_pick_network() {
   scan_file=$(mktemp)
   map_file="${scan_file}.map"
 
-  ui_msg "Wi-Fi scan" "Scanning on ${iface}.\nThis may take up to 20 seconds."
-  if ! wifi_scan_to_file "$iface" "$scan_file"; then
+  if [[ -n "${UI_BIN:-}" ]]; then
+    if ! ui_wait "Wi-Fi scan" "Scanning on ${iface}…" wifi_scan_to_file "$iface" "$scan_file"; then
+      rm -f "$scan_file" "$map_file"
+      ui_msg "Scan failed" "Could not scan Wi-Fi on ${iface}.\n\nBackend: $(detect_netplan_renderer)\n\nUse \"Connect to Hidden/Custom SSID\" and enter the network name manually.\n\nStock Ubuntu server uses networkd + wpa_supplicant (no extra packages)."
+      return 1
+    fi
+  elif ! wifi_scan_to_file "$iface" "$scan_file"; then
     rm -f "$scan_file" "$map_file"
     ui_msg "Scan failed" "Could not scan Wi-Fi on ${iface}.\n\nBackend: $(detect_netplan_renderer)\n\nUse \"Connect to Hidden/Custom SSID\" and enter the network name manually.\n\nStock Ubuntu server uses networkd + wpa_supplicant (no extra packages)."
     return 1
@@ -1169,17 +1432,35 @@ menu_wifi_pick_network() {
   }
 
   items+=("manual" "Enter SSID manually")
+  ui_term_restore
   tag=$(ui_menu "Wi-Fi scan: ${iface}" "Select a network:" "${items[@]}") || {
     rm -f "$map_file"
     return 1
   }
   if [[ "$tag" == "manual" ]]; then
     rm -f "$map_file"
-    ui_input "Wi-Fi SSID" "Enter network name (SSID):" ""
+    ssid=$(ui_input "Wi-Fi SSID" "Enter network name (SSID):" "") || return 1
+    ssid=$(validate_ssid "$ssid") || {
+      ui_msg "Invalid SSID" "That network name is not valid.\nUse 1-32 printable characters."
+      return 1
+    }
+    printf '%s' "$ssid"
     return 0
   fi
-  awk -F '\t' -v t="$tag" '$1==t {print $2; exit}' "$map_file"
+  if [[ ! "$tag" =~ ^net[0-9]+$ ]]; then
+    rm -f "$map_file"
+    ui_msg "Selection error" "Invalid network selection.\nPlease try scanning again."
+    return 1
+  fi
+  ssid=$(awk -F '\t' -v t="$tag" '$1==t {print $2; exit}' "$map_file")
+  ssid=$(validate_ssid "$ssid") || {
+    rm -f "$map_file"
+    ui_msg "Selection error" "Invalid network name from scan.\nPlease try scanning again."
+    return 1
+  }
   rm -f "$map_file"
+  [[ -n "$ssid" ]] || return 1
+  printf '%s' "$ssid"
 }
 
 menu_configure_wifi() {
@@ -1204,7 +1485,11 @@ menu_configure_wifi() {
     case "$choice" in
       scan)
         ssid=$(menu_wifi_pick_network "$iface") || continue
-        [[ -n "$ssid" ]] || continue
+        ssid=$(validate_ssid "$ssid") || {
+          ui_msg "Selection error" "Invalid network name.\nPlease scan again."
+          continue
+        }
+        ui_term_restore
         if uses_network_manager && command -v nmcli >/dev/null 2>&1; then
           security=$(timeout 10 nmcli -t -f SSID,SECURITY dev wifi list ifname "$iface" 2>/dev/null | awk -F: -v s="$ssid" '$1==s{print $2; exit}')
         else
@@ -1219,23 +1504,22 @@ menu_configure_wifi() {
         fi
         write_netplan_wifi "$iface" "$ssid" "$password"
         apply_netplan_or_show_error || continue
-        ip_link_set "$iface" up || true
-        sleep 3
-        ui_msg "Applied" "Connected ${iface} to:\n${ssid}\n\n$(wifi_apply_result_text "$iface")"
+        menu_wifi_post_connect "$iface" "$ssid"
         ;;
       manual)
         hidden=0
         ui_yesno "Hidden SSID" "Is this a hidden Wi-Fi network?" && hidden=1 || hidden=0
         ssid=$(ui_input "Wi-Fi SSID" "Network name:" "") || continue
-        [[ -n "$ssid" ]] || continue
+        ssid=$(validate_ssid "$ssid") || {
+          ui_msg "Invalid SSID" "That network name is not valid.\nUse 1-32 printable characters."
+          continue
+        }
         ui_yesno "Security" "Does ${ssid} require a password?" && {
           password=$(ui_password "Wi-Fi password" "Password for ${ssid}:") || continue
         } || password=""
         write_netplan_wifi "$iface" "$ssid" "$password" "" "" "$hidden"
         apply_netplan_or_show_error || continue
-        ip_link_set "$iface" up || true
-        sleep 3
-        ui_msg "Applied" "Configured ${iface} for SSID:\n${ssid}\n\n$(wifi_apply_result_text "$iface")"
+        menu_wifi_post_connect "$iface" "$ssid"
         ;;
       dhcp)
         if ! IFS=$'\t' read -r ssid password < <(read_wifi_credentials "$iface" 2>/dev/null); then
@@ -1248,8 +1532,7 @@ menu_configure_wifi() {
         }
         write_netplan_wifi "$iface" "$ssid" "$password"
         apply_netplan_or_show_error || continue
-        ip_link_set "$iface" up || true
-        ui_msg "Applied" "DHCP reapplied for ${ssid} on ${iface}."
+        menu_wifi_post_connect "$iface" "$ssid"
         ;;
       static)
         if ! IFS=$'\t' read -r ssid password < <(read_wifi_credentials "$iface" 2>/dev/null); then
@@ -1260,8 +1543,7 @@ menu_configure_wifi() {
         prefix=$(mask_to_prefix "$netmask")
         write_netplan_wifi "$iface" "$ssid" "$password" "$addr" "$prefix" 0 "$gateway" "$dns1" "$dns2"
         apply_netplan_or_show_error || continue
-        ip_link_set "$iface" up || true
-        ui_msg "Applied" "Static IP set on ${iface} for ${ssid}:\n${addr}/${prefix}"
+        menu_wifi_post_connect "$iface" "$ssid"
         ;;
       up)
         ip_link_set "$iface" up
@@ -1271,7 +1553,11 @@ menu_configure_wifi() {
         ;;
       renew)
         renew_dhcp_lease "$iface"
-        ui_msg "DHCP renewed" "Requested DHCP renewal on ${iface}.\n\n$(ip -4 -br addr show dev "$iface" 2>/dev/null || true)"
+        if [[ "$(iface_ipv4_mode_label "$iface")" == "DHCP" ]]; then
+          ui_gauge_run "DHCP" "Waiting for DHCP on ${iface}…" wait_for_ipv4_dhcp "$iface" 30 || true
+        fi
+        ui_term_restore
+        ui_msg "DHCP renewed" "$(format_wifi_connect_summary "$iface" "")"
         ;;
       netplan)
         iface_status_text "$iface"
@@ -1344,6 +1630,7 @@ menu_main() {
       log "Show session log" \
       apply "Apply netplan now" \
       quit "Exit") || exit 0
+    choice=$(sanitize_ui_text "$choice")
 
     case "$choice" in
       ethernet) menu_configure_ethernet ;;
@@ -1365,6 +1652,9 @@ menu_main() {
       log) show_last_apply_log ;;
       apply) menu_apply_netplan ;;
       quit) exit 0 ;;
+      *)
+        [[ -n "$choice" ]] && ui_msg "Menu error" "Unknown menu selection.\nPlease try again."
+        ;;
     esac
   done
 }
