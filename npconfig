@@ -11,6 +11,7 @@ fi
 
 NETPLAN_DIR=/etc/netplan
 FILE_PREFIX=99-npconfig
+NP_VERSION=1.0.0
 UI_BIN=""
 UI_TTY=/dev/tty
 NETPLAN_RENDERER=""
@@ -21,14 +22,14 @@ NP_XTRACE_FD=""
 NP_WPA_CTRL_DIR=/run/npconfig-wpa
 
 log_init() {
-  mkdir -p "$NP_LOG_DIR"
+  log_secure_dir
   NP_SESSION_LOG="${NP_LOG_DIR}/session-$(date +%Y%m%d-%H%M%S)-$$.log"
   ln -sfn "$(basename "$NP_SESSION_LOG")" "${NP_LOG_DIR}/latest.log"
   NETPLAN_LAST_LOG="$NP_SESSION_LOG"
 
   {
     echo "=== npconfig session $(date -Is) pid=$$ ==="
-    echo "argv: $(printf '%q ' "$@")"
+    echo "argv: $(log_redact_argv "$@")"
     echo "hostname: $(hostname 2>/dev/null || true)"
     echo "id: $(id 2>/dev/null || true)"
     echo "npconfig: $(command -v npconfig 2>/dev/null || echo unknown)"
@@ -39,13 +40,49 @@ log_init() {
     ls -la "${NETPLAN_DIR}/" 2>/dev/null || true
     echo "---"
   } >>"$NP_SESSION_LOG"
+  log_touch_session
 
-  # Trace every command to the log file only (does not break whiptail/dialog).
-  NP_XTRACE_FD=19
-  exec 19>>"$NP_SESSION_LOG"
-  export BASH_XTRACEFD=19
-  export PS4='+ [$(date +%H:%M:%S)] ${BASH_SOURCE##*/}:${LINENO}: '
-  set -x
+  # Full shell trace is opt-in; it can leak secrets into logs.
+  if [[ "${NP_LOG_TRACE:-0}" == 1 ]]; then
+    NP_XTRACE_FD=19
+    exec 19>>"$NP_SESSION_LOG"
+    export BASH_XTRACEFD=19
+    export PS4='+ [$(date +%H:%M:%S)] ${BASH_SOURCE##*/}:${LINENO}: '
+    set -x
+  fi
+}
+
+log_secure_dir() {
+  mkdir -p "$NP_LOG_DIR"
+  chmod 700 "$NP_LOG_DIR" 2>/dev/null || true
+}
+
+log_touch_session() {
+  [[ -n "${NP_SESSION_LOG:-}" && -f "$NP_SESSION_LOG" ]] || return 0
+  chmod 600 "$NP_SESSION_LOG" 2>/dev/null || true
+}
+
+log_redact_stream() {
+  sed -E \
+    -e 's/([Pp]assword:[[:space:]]*")[^"]*"/\1[redacted]"/g' \
+    -e 's/([Pp]assword:[[:space:]]*)[^[:space:]#]+/\1[redacted]/g'
+}
+
+log_redact_argv() {
+  local -a out=()
+  local redact=0 arg
+  for arg in "$@"; do
+    if [[ $redact -eq 1 ]]; then
+      out+=("[redacted]")
+      redact=0
+    elif [[ "$arg" == passphrase || "$arg" == psk || "$arg" == password ]]; then
+      out+=("$arg")
+      redact=1
+    else
+      out+=("$arg")
+    fi
+  done
+  printf '%q ' "${out[@]}"
 }
 
 log_section() {
@@ -63,9 +100,10 @@ log_write_file() {
   {
     echo
     echo "=== ${title}: ${file} ==="
-    cat "$file"
+    log_redact_stream <"$file"
     echo "=== end ${file} ==="
   } >>"$NP_SESSION_LOG"
+  log_touch_session
 }
 
 log_cmd() {
@@ -79,13 +117,14 @@ log_cmd() {
     echo ">>> start: $(date -Is)"
   } >>"$NP_SESSION_LOG"
   set +e
-  "$@" >>"$NP_SESSION_LOG" 2>&1
-  local rc=$?
+  "$@" 2>&1 | log_redact_stream >>"$NP_SESSION_LOG"
+  local rc=${PIPESTATUS[0]}
   set -e
   {
     echo ">>> exit: ${rc}"
     echo ">>> end: $(date -Is)"
   } >>"$NP_SESSION_LOG"
+  log_touch_session
   return "$rc"
 }
 
@@ -109,9 +148,10 @@ log_cmd_to() {
     echo ">>> end: $(date -Is)"
     if [[ -f "$outfile" ]]; then
       echo ">>> captured ($(wc -c <"$outfile") bytes):"
-      cat "$outfile"
+      log_redact_stream <"$outfile"
     fi
   } >>"$NP_SESSION_LOG"
+  log_touch_session
   return "$rc"
 }
 
@@ -396,7 +436,7 @@ looks_like_ipv4() {
 }
 
 iface_exists() {
-  [[ -d "/sys/class/net/$1" ]]
+  [[ "$1" =~ ^[a-zA-Z0-9_.:-]+$ ]] && [[ -d "/sys/class/net/$1" ]]
 }
 
 is_virtual_iface() {
@@ -917,8 +957,9 @@ append_backend_logs() {
     fi
     echo
     echo "=== merged netplan (netplan get) ==="
-    netplan get 2>&1 | head -100 || true
+    netplan get 2>&1 | head -100 | log_redact_stream || true
   } >>"$log"
+  log_touch_session
 }
 
 apply_netplan() {
@@ -1690,6 +1731,9 @@ Notes:
 - Menu uses dialog or whiptail (install one if missing)
 - Uses iproute2 (ip) only; no extra packages required on stock Ubuntu
 - Full session logging: ${NP_LOG_DIR}/session-*.log (symlink: ${NP_LOG_DIR}/latest.log)
+- Logs are root-only (mode 700/600); Wi-Fi passwords are redacted in logs
+- Set NP_LOG_TRACE=1 for verbose shell tracing (debug only)
+- Version: ${NP_VERSION}
 USAGE
 }
 
@@ -1716,6 +1760,10 @@ parse_wifi_args() {
 
   [[ $# -gt 0 ]] || { echo "npconfig: Wi-Fi SSID missing" >&2; exit 2; }
   ssid="$1"
+  ssid=$(validate_ssid "$ssid") || {
+    echo "npconfig: invalid SSID" >&2
+    exit 2
+  }
   shift
 
   while [[ $# -gt 0 ]]; do

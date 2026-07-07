@@ -16,10 +16,14 @@ No sysadmin should have to bring a netplan manual just to bring networking up.
 
 - Linux with **netplan** and **iproute2** (`ip`)
 - **root** / `sudo`
-- For Wi-Fi scan/menu: **NetworkManager** (`nmcli`) recommended, or **iw** as fallback
+- For Wi-Fi scan/menu on **Ubuntu Server**: `wpasupplicant` (stock) — `nmcli` or `iw` optional fallbacks
 - For interactive menu: **whiptail** or **dialog**
 
 ```bash
+# Ubuntu Server (systemd-networkd)
+sudo apt-get install -y netplan.io iproute2 wpasupplicant whiptail
+
+# Ubuntu Desktop (NetworkManager)
 sudo apt-get install -y netplan.io iproute2 network-manager whiptail
 ```
 
@@ -110,6 +114,14 @@ netplan apply
 ```
 
 These files are intentionally prefixed with `99-` so they override simpler defaults while remaining easy to find and remove.
+
+## Security notes
+
+- **Runs as root** — only install and run from a trusted source (this repo or your own build).
+- **Wi-Fi passwords** are stored in `/etc/netplan/99-npconfig-*.yaml` (mode `600`), which is standard for netplan.
+- **Session logs** live in `/var/log/npconfig/` (mode `700`; log files `600`). Passwords are **redacted** in logs.
+- **Verbose shell tracing** is off by default. For deep debugging only: `sudo NP_LOG_TRACE=1 npconfig menu`
+- Remove npconfig overlays anytime: `sudo rm /etc/netplan/99-npconfig-*.yaml && sudo netplan apply`
 
 ## Example netplan output (Wi-Fi DHCP)
 
